@@ -88,6 +88,36 @@ class TestPointCloudProcessor(unittest.TestCase):
         np.testing.assert_allclose(maps["curve_x"], 0.0, atol=1e-10)
         np.testing.assert_allclose(maps["curve_y"], 0.0, atol=1e-10)
 
+    def test_pre_smooth_x_sigma_reduces_vertical_stripes_in_grad_x(self):
+        width = 96
+        height = 72
+        y, x = np.indices((height, width), dtype=np.float64)
+        stripe_noise = 0.08 * np.sign(np.sin(np.arange(width, dtype=np.float64) * 1.7))
+        z = 0.002 * y + stripe_noise[np.newaxis, :]
+
+        raw_maps = compute_surface_maps(
+            z,
+            dx_mm=0.08,
+            dy_mm=0.08,
+            gaussian_sigma=0.0,
+            pre_smooth_x_sigma=0.0,
+        )
+        smooth_maps = compute_surface_maps(
+            z,
+            dx_mm=0.08,
+            dy_mm=0.08,
+            gaussian_sigma=0.0,
+            pre_smooth_x_sigma=0.8,
+        )
+
+        raw_grad_x = np.median(np.abs(raw_maps["grad_x"]))
+        smooth_grad_x = np.median(np.abs(smooth_maps["grad_x"]))
+        raw_grad_y = np.median(np.abs(raw_maps["grad_y"]))
+        smooth_grad_y = np.median(np.abs(smooth_maps["grad_y"]))
+
+        self.assertLess(smooth_grad_x, raw_grad_x * 0.75)
+        np.testing.assert_allclose(smooth_grad_y, raw_grad_y, rtol=0.05, atol=1e-6)
+
     def test_seam_correction_does_not_introduce_y_derivative_artifacts(self):
         stripe_height = 32
         width = 80
@@ -238,6 +268,28 @@ class TestPointCloudProcessor(unittest.TestCase):
             sigma_x=0.0,
             blend_width=0,
             method="linear",
+        )
+
+        self.assertEqual(flattened.shape, image.shape)
+        seam_grad_before = np.median(np.abs(np.gradient(image, axis=0))[stripe_height - 1:stripe_height + 1, :])
+        seam_grad_after = np.median(np.abs(np.gradient(flattened, axis=0))[stripe_height - 1:stripe_height + 1, :])
+        self.assertLess(seam_grad_after, seam_grad_before)
+
+    def test_flatten_seam_artifacts_supports_quadratic_mode(self):
+        stripe_height = 32
+        width = 96
+        y, x = np.indices((stripe_height * 3, width), dtype=np.float64)
+        image = 0.01 * np.sin(x / 8.0) + 0.004 * np.cos(y / 5.0) + 0.001 * x
+        image[stripe_height - 1:stripe_height + 2, :] += 0.08
+
+        flattened = flatten_seam_artifacts(
+            image,
+            stripe_height=stripe_height,
+            num_stripes=3,
+            half_window=2,
+            sigma_x=0.0,
+            blend_width=0,
+            method="quadratic",
         )
 
         self.assertEqual(flattened.shape, image.shape)

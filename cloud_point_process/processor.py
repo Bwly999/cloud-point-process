@@ -31,6 +31,7 @@ class ProcessingConfig:
     seam_flatten_sigma_x: float = 0.0
     seam_flatten_blend_width: int = 0
     seam_flatten_method: str = "linear"
+    pre_smooth_x_sigma: float = 0.0
     gaussian_sigma: float = 0.8
     crop_left_px: int = 0
     crop_right_px: int = 0
@@ -238,7 +239,7 @@ def flatten_seam_artifacts(
 ) -> np.ndarray:
     if half_window <= 0:
         return z_mm.copy()
-    if method not in ("linear", "cubic"):
+    if method not in ("linear", "quadratic", "cubic"):
         raise ValueError("Unsupported seam flatten method: {}".format(method))
 
     flattened = z_mm.copy()
@@ -274,6 +275,14 @@ def flatten_seam_artifacts(
             t = (row - top_anchor) / span
             if method == "linear":
                 rebuilt = top_line * (1.0 - t) + bottom_line * t
+            elif method == "quadratic":
+                # 使用固定二阶导风格的过渡：令过渡曲线为二次函数，
+                # 满足上边界高度、下边界高度以及上边界一阶导约束。
+                # 这样斜率会沿 Y 方向均匀变化，比 linear 更柔和，
+                # 同时又比 cubic 更克制。
+                a = (bottom_line - top_line - top_slope * span) / (span * span)
+                delta = row - top_anchor
+                rebuilt = a * delta * delta + top_slope * delta + top_line
             else:
                 h00 = 2.0 * t * t * t - 3.0 * t * t + 1.0
                 h10 = t * t * t - 2.0 * t * t + t
@@ -325,14 +334,20 @@ def compute_surface_maps(
     dx_mm: float,
     dy_mm: float,
     gaussian_sigma: float = 0.8,
+    pre_smooth_x_sigma: float = 0.0,
 ) -> Dict[str, np.ndarray]:
     if z_mm.ndim != 2:
         raise ValueError("Height map must be a 2D array.")
 
+    z_used = z_mm.astype(np.float64, copy=True)
+
+    # 仅在 X 方向做轻量平滑，用来压制列间高频条纹。这个步骤发生在
+    # 求导前，主要影响 grad_x / curv2_x / curve_x，对 Y 向结果影响很小。
+    if pre_smooth_x_sigma > 0:
+        z_used = gaussian_filter1d(z_used, sigma=pre_smooth_x_sigma, axis=1, mode="nearest")
+
     if gaussian_sigma > 0:
-        z_used = gaussian_filter(z_mm, sigma=gaussian_sigma, mode="nearest")
-    else:
-        z_used = z_mm.astype(np.float64, copy=True)
+        z_used = gaussian_filter(z_used, sigma=gaussian_sigma, mode="nearest")
 
     edge_order = 2 if min(z_used.shape) >= 3 else 1
     grad_y, grad_x = np.gradient(z_used, dy_mm, dx_mm, edge_order=edge_order)
@@ -487,6 +502,7 @@ def process_heightmap(input_path: Path, output_dir: Path, config: ProcessingConf
         dx_mm=config.dx_mm,
         dy_mm=resampled_dy_mm,
         gaussian_sigma=config.gaussian_sigma,
+        pre_smooth_x_sigma=config.pre_smooth_x_sigma,
     )
 
     save_preview_png(raw_height_mm, output_dir / "height_raw_preview.png", "viridis", False, "Raw Height (mm)")
@@ -577,9 +593,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--seam-flatten-method",
-        choices=["linear", "cubic"],
+        choices=["linear", "quadratic", "cubic"],
         default="linear",
-        help="接缝窄带重建方法。linear 为旧版简单插值，通常更保守；cubic 为三次插值。",
+        help="接缝窄带重建方法。linear 为旧版简单插值；quadratic 为固定二阶导风格过渡；cubic 为三次插值。",
+    )
+    parser.add_argument(
+        "--pre-smooth-x-sigma",
+        type=float,
+        default=0.0,
+        help="求导前仅对 X 方向做轻量高斯平滑，用于抑制 grad_x 中的纵向条纹。",
     )
     parser.add_argument(
         "--gaussian-sigma",
@@ -610,6 +632,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         seam_flatten_sigma_x=args.seam_flatten_sigma_x,
         seam_flatten_blend_width=args.seam_flatten_blend_width,
         seam_flatten_method=args.seam_flatten_method,
+        pre_smooth_x_sigma=args.pre_smooth_x_sigma,
         gaussian_sigma=args.gaussian_sigma,
     )
 

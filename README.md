@@ -56,6 +56,18 @@ python process_heightmap.py ^
   --crop-right-px 80
 ```
 
+### 4. 只打包代码和文档为 zip
+
+```bash
+python package_zip.py
+```
+
+如需指定输出路径：
+
+```bash
+python package_zip.py --output my-release.zip
+```
+
 ## 关键参数
 
 ### 基础分辨率
@@ -95,6 +107,7 @@ python process_heightmap.py ^
   - 对上下锚线做 `X` 向轻平滑
 - `--seam-flatten-method`
   - `linear` 为旧版简单插值，默认使用
+  - `quadratic` 为固定二阶导风格过渡
   - `cubic` 为三次插值
 
 推荐调参顺序：
@@ -102,7 +115,8 @@ python process_heightmap.py ^
 1. 先把 `--seam-flatten-half-window` 设小，例如 `2`
 2. 如果边缘还有明显过渡，再增加 `--seam-flatten-blend-width`
 3. 默认优先使用 `--seam-flatten-method linear`
-4. 最后再考虑增大 `--seam-flatten-sigma-x` 或尝试 `cubic`
+4. 如果希望比 linear 更柔和、但又不想像 cubic 那样过度弯折，可尝试 `quadratic`
+5. 最后再考虑增大 `--seam-flatten-sigma-x` 或尝试 `cubic`
 
 ### 求导前轻平滑
 
@@ -156,3 +170,24 @@ python process_heightmap.py ^
 ```bash
 python process_heightmap.py --help
 ```
+
+## 代码打包说明
+
+`package_zip.py` 会使用白名单打包，只包含代码和文档：
+
+- `.gitignore`
+- `README.md`
+- `process_heightmap.py`
+- `package_zip.py`
+- `cloud_point_process/`
+- `tests/`
+- `docs/`
+
+不会包含：
+
+- `demo_outputs*`
+- `sample_outputs*`
+- `debug_outputs*`
+- `tmp_sigma_scan/`
+- `__pycache__/`
+- 现有 zip 包
