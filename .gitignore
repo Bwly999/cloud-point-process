@@ -1,0 +1,24 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local virtual envs
+.venv/
+venv/
+env/
+
+# Generated outputs
+debug_outputs/
+debug_outputs_after_fix/
+demo_outputs/
+demo_outputs_*/
+sample_outputs/
+sample_outputs_verify/
+tmp_sigma_scan/
+
+# Binary packages and archives
+*.zip
+
+# OS / editor noise
+.DS_Store
+Thumbs.db

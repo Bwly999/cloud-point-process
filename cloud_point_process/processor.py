@@ -1,0 +1,637 @@
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Sequence, Tuple
+
+import matplotlib
+
+matplotlib.use("Agg")
+
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.colors import TwoSlopeNorm
+from PIL import Image, ImageDraw
+from scipy.ndimage import gaussian_filter, gaussian_filter1d
+
+
+@dataclass
+class ProcessingConfig:
+    dx_mm: float = 0.08
+    dy_mm: float = 0.005615
+    dz_mm: float = 0.0001
+    stripe_height: int = 2048
+    num_stripes: int = 3
+    downsample_factor: int = 16
+    seam_window: int = 64
+    transition_window: int = 0
+    smooth_sigma_x: float = 2.0
+    seam_flatten_half_window: int = 2
+    seam_flatten_sigma_x: float = 0.0
+    seam_flatten_blend_width: int = 0
+    seam_flatten_method: str = "linear"
+    gaussian_sigma: float = 0.8
+    crop_left_px: int = 0
+    crop_right_px: int = 0
+
+    @property
+    def expected_height(self) -> int:
+        return self.stripe_height * self.num_stripes
+
+
+def load_height_png(path: Path) -> np.ndarray:
+    image = Image.open(str(path))
+    array = np.array(image)
+
+    if array.ndim != 2:
+        raise ValueError("Input image must be a single-channel 16-bit PNG.")
+
+    if array.dtype == np.uint16:
+        return array
+
+    if array.dtype.kind in ("i", "u") and array.min() >= 0 and array.max() <= 65535:
+        return array.astype(np.uint16)
+
+    raise ValueError("Input image must be a 16-bit grayscale PNG.")
+
+
+def save_height_png(array: np.ndarray, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image = Image.fromarray(np.asarray(array, dtype=np.uint16), mode="I;16")
+    image.save(str(path))
+
+
+def save_float_tiff(array: np.ndarray, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image = Image.fromarray(np.asarray(array, dtype=np.float32), mode="F")
+    image.save(str(path))
+
+
+def generate_synthetic_heightmap(
+    width: int = 2048,
+    stripe_height: int = 2048,
+    num_stripes: int = 3,
+    dz_mm: float = 0.0001,
+) -> np.ndarray:
+    total_height = stripe_height * num_stripes
+    x_mm = np.linspace(-6.0, 6.0, width, dtype=np.float64)
+    y_mm = np.linspace(-4.0, 4.0, total_height, dtype=np.float64)
+    xx, yy = np.meshgrid(x_mm, y_mm)
+
+    base = 0.35 * np.sin(xx * 0.7) + 0.22 * np.cos(yy * 0.9)
+    saddle = 0.012 * xx * yy
+    bump = 0.55 * np.exp(-((xx + 1.8) ** 2 + (yy - 1.0) ** 2) / 2.8)
+    pit = -0.48 * np.exp(-((xx - 2.1) ** 2 + (yy + 1.5) ** 2) / 1.7)
+    ripple = 0.03 * np.sin(xx * 5.2 + yy * 2.6)
+
+    surface_mm = base + saddle + bump + pit + ripple
+
+    phase = np.linspace(0.0, 2.0 * np.pi, width, dtype=np.float64)
+    delta1 = 0.55 + 0.10 * np.sin(phase) + 0.04 * np.linspace(-1.0, 1.0, width)
+    delta2 = -0.42 + 0.06 * np.cos(phase * 0.7)
+
+    surface_mm[stripe_height:stripe_height * 2] += delta1
+    surface_mm[stripe_height * 2:] += delta1 + delta2
+
+    # Add a narrow seam-local zigzag artifact instead of extending the zigzag
+    # across the whole scan band. This better matches stitched real data where
+    # the residual only appears on the seam line itself.
+    seam_phase = np.arange(width, dtype=np.float64) / 6.0
+    seam_frac = seam_phase - np.floor(seam_phase)
+    seam_triangle = 2.0 * np.abs(2.0 * seam_frac - 1.0) - 1.0
+    for seam_y, amplitude in ((stripe_height, 0.08), (stripe_height * 2, -0.07)):
+        for row in range(seam_y - 3, seam_y + 4):
+            if 0 <= row < total_height:
+                weight = 1.0 - 0.18 * abs(row - seam_y)
+                surface_mm[row, :] += amplitude * seam_triangle * weight
+
+    rng = np.random.RandomState(7)
+    surface_mm += rng.normal(scale=0.002, size=surface_mm.shape)
+
+    surface_mm = surface_mm - surface_mm.min() + 0.25
+    gray = np.rint(surface_mm / dz_mm)
+    gray = np.clip(gray, 0, np.iinfo(np.uint16).max)
+    return gray.astype(np.uint16)
+
+
+def _project_window_to_target(rows: np.ndarray, target_row: float) -> np.ndarray:
+    row_axis = rows[:, 0]
+    values = rows[:, 1:]
+    row_mean = row_axis.mean()
+    centered_rows = row_axis - row_mean
+    denom = np.sum(centered_rows * centered_rows)
+    if denom <= 0:
+        return np.median(values, axis=0)
+
+    value_mean = values.mean(axis=0)
+    slope = np.sum(centered_rows[:, np.newaxis] * (values - value_mean), axis=0) / denom
+    return value_mean + slope * (target_row - row_mean)
+
+
+def _smoothstep(values: np.ndarray) -> np.ndarray:
+    clipped = np.clip(values, 0.0, 1.0)
+    return clipped * clipped * (3.0 - 2.0 * clipped)
+
+
+def _estimate_row_slope(image: np.ndarray, row: int) -> np.ndarray:
+    if image.shape[0] == 1:
+        return np.zeros(image.shape[1], dtype=np.float64)
+    if row <= 0:
+        return image[1, :] - image[0, :]
+    if row >= image.shape[0] - 1:
+        return image[-1, :] - image[-2, :]
+    return 0.5 * (image[row + 1, :] - image[row - 1, :])
+
+
+def correct_scan_band_offsets(
+    z_mm: np.ndarray,
+    stripe_height: int,
+    seam_window: int,
+    transition_window: int,
+    smooth_sigma_x: float,
+    seam_flatten_half_window: int = 2,
+    seam_flatten_sigma_x: float = 0.0,
+    seam_flatten_blend_width: int = 0,
+    seam_flatten_method: str = "linear",
+    num_stripes: int | None = None,
+) -> Tuple[np.ndarray, List[np.ndarray]]:
+    if z_mm.ndim != 2:
+        raise ValueError("Height map must be a 2D array.")
+    if stripe_height <= 0:
+        raise ValueError("stripe_height must be positive.")
+    if z_mm.shape[0] % stripe_height != 0:
+        raise ValueError("Image height must be divisible by stripe_height.")
+
+    inferred_stripes = z_mm.shape[0] // stripe_height
+    if num_stripes is None:
+        num_stripes = inferred_stripes
+    if num_stripes != inferred_stripes:
+        raise ValueError("Configured stripe count does not match input height.")
+
+    width = z_mm.shape[1]
+    zero_offset = np.zeros(width, dtype=np.float64)
+    cumulative_offsets = [zero_offset]
+    seam_offsets = []
+    running = zero_offset.copy()
+
+    for stripe_index in range(1, num_stripes):
+        seam_y = stripe_index * stripe_height
+        above_y0 = max(0, seam_y - seam_window)
+        below_y1 = min(z_mm.shape[0], seam_y + seam_window)
+        above = z_mm[above_y0:seam_y, :]
+        below = z_mm[seam_y:below_y1, :]
+        if above.size == 0 or below.size == 0:
+            raise ValueError("Seam window exceeds image bounds.")
+
+        # 这里不是给整条接缝只算一个偏移量，而是对每个 X 列单独估计
+        # 一次，最终得到长度等于图像宽度的 Δ(x)。
+        target_row = seam_y - 0.5
+        above_rows = np.column_stack(
+            [np.arange(above_y0, seam_y, dtype=np.float64), above.astype(np.float64)]
+        )
+        below_rows = np.column_stack(
+            [np.arange(seam_y, below_y1, dtype=np.float64), below.astype(np.float64)]
+        )
+        delta = _project_window_to_target(below_rows, target_row) - _project_window_to_target(
+            above_rows, target_row
+        )
+        # 只做轻微的 X 向平滑。若平滑过强，会把真实的列间偏移差异抹掉，
+        # 反而在接缝处留下残差，并在 grad_y / curv_y 中被放大。
+        if smooth_sigma_x > 0:
+            delta = gaussian_filter1d(delta, sigma=smooth_sigma_x, mode="nearest")
+        seam_offsets.append(delta)
+        running = running + delta
+        cumulative_offsets.append(running.copy())
+
+    correction = np.zeros_like(z_mm, dtype=np.float64)
+    for stripe_index, stripe_offset in enumerate(cumulative_offsets):
+        start = stripe_index * stripe_height
+        end = start + stripe_height
+        correction[start:end, :] = stripe_offset
+
+    # 整带补偿：第 2 道减 Δ1(x)，第 3 道减 Δ1(x)+Δ2(x)。
+    corrected = z_mm - correction
+    if seam_flatten_half_window > 0:
+        # 接缝窄带重建发生在重采样前，目的是在原始高分辨率网格上先去掉
+        # seam-local 的锯齿残差，再做 Y 向分块采样。
+        corrected = flatten_seam_artifacts(
+            corrected,
+            stripe_height=stripe_height,
+            num_stripes=num_stripes,
+            half_window=seam_flatten_half_window,
+            sigma_x=seam_flatten_sigma_x,
+            blend_width=seam_flatten_blend_width,
+            method=seam_flatten_method,
+        )
+    return corrected, seam_offsets
+
+
+def flatten_seam_artifacts(
+    z_mm: np.ndarray,
+    stripe_height: int,
+    num_stripes: int,
+    half_window: int = 2,
+    sigma_x: float = 0.0,
+    blend_width: int = 0,
+    method: str = "linear",
+) -> np.ndarray:
+    if half_window <= 0:
+        return z_mm.copy()
+    if method not in ("linear", "cubic"):
+        raise ValueError("Unsupported seam flatten method: {}".format(method))
+
+    flattened = z_mm.copy()
+    for stripe_index in range(1, num_stripes):
+        seam_y = stripe_index * stripe_height
+        core_start = max(1, seam_y - half_window)
+        core_end = min(flattened.shape[0] - 1, seam_y + half_window)
+        band_start = max(0, core_start - blend_width)
+        band_end = min(flattened.shape[0], core_end + blend_width)
+        top_anchor = max(0, band_start - 1)
+        bottom_anchor = min(flattened.shape[0] - 1, band_end)
+        if core_end <= core_start or bottom_anchor <= top_anchor:
+            continue
+
+        top_line = flattened[top_anchor, :].copy()
+        bottom_line = flattened[bottom_anchor, :].copy()
+        top_slope = _estimate_row_slope(flattened, top_anchor)
+        bottom_slope = _estimate_row_slope(flattened, bottom_anchor)
+        if sigma_x > 0:
+            top_line = gaussian_filter1d(top_line, sigma=sigma_x, mode="nearest")
+            bottom_line = gaussian_filter1d(bottom_line, sigma=sigma_x, mode="nearest")
+            top_slope = gaussian_filter1d(top_slope, sigma=sigma_x, mode="nearest")
+            bottom_slope = gaussian_filter1d(bottom_slope, sigma=sigma_x, mode="nearest")
+
+        # 核心带使用 Hermite 三次插值，匹配上下边界的高度和斜率。
+        # 这样不仅高度连续，一阶导数也更连续，能明显减轻 half_window
+        # 边界处再次出现的过渡感。
+        span = float(bottom_anchor - top_anchor)
+        original_band = flattened[band_start:band_end, :].copy()
+
+        rebuilt_rows = []
+        for row in range(band_start, band_end):
+            t = (row - top_anchor) / span
+            if method == "linear":
+                rebuilt = top_line * (1.0 - t) + bottom_line * t
+            else:
+                h00 = 2.0 * t * t * t - 3.0 * t * t + 1.0
+                h10 = t * t * t - 2.0 * t * t + t
+                h01 = -2.0 * t * t * t + 3.0 * t * t
+                h11 = t * t * t - t * t
+                rebuilt = (
+                    h00 * top_line
+                    + h10 * (top_slope * span)
+                    + h01 * bottom_line
+                    + h11 * (bottom_slope * span)
+                )
+            rebuilt_rows.append(rebuilt)
+
+        rebuilt_band = np.vstack(rebuilt_rows)
+        # 在核心带外再加一段混合区，让“重建结果”和“原始图”平滑交接。
+        weights = np.zeros(band_end - band_start, dtype=np.float64)
+        for idx, row in enumerate(range(band_start, band_end)):
+            if core_start <= row < core_end:
+                weights[idx] = 1.0
+            elif row < core_start and blend_width > 0:
+                weights[idx] = _smoothstep(np.array([(row - band_start + 1) / float(blend_width + 1)]))[0]
+            elif row >= core_end and blend_width > 0:
+                weights[idx] = _smoothstep(
+                    np.array([(band_end - row) / float(blend_width + 1)])
+                )[0]
+
+        flattened[band_start:band_end, :] = (
+            original_band * (1.0 - weights[:, np.newaxis])
+            + rebuilt_band * weights[:, np.newaxis]
+        )
+
+    return flattened
+
+
+def downsample_y(z_mm: np.ndarray, factor: int, dy_mm: float) -> Tuple[np.ndarray, float]:
+    if factor <= 0:
+        raise ValueError("Downsample factor must be positive.")
+    if z_mm.shape[0] % factor != 0:
+        raise ValueError("Image height must be divisible by the downsample factor.")
+    if factor == 1:
+        return z_mm.copy(), dy_mm
+
+    reshaped = z_mm.reshape(z_mm.shape[0] // factor, factor, z_mm.shape[1])
+    return reshaped.mean(axis=1), dy_mm * factor
+
+
+def compute_surface_maps(
+    z_mm: np.ndarray,
+    dx_mm: float,
+    dy_mm: float,
+    gaussian_sigma: float = 0.8,
+) -> Dict[str, np.ndarray]:
+    if z_mm.ndim != 2:
+        raise ValueError("Height map must be a 2D array.")
+
+    if gaussian_sigma > 0:
+        z_used = gaussian_filter(z_mm, sigma=gaussian_sigma, mode="nearest")
+    else:
+        z_used = z_mm.astype(np.float64, copy=True)
+
+    edge_order = 2 if min(z_used.shape) >= 3 else 1
+    grad_y, grad_x = np.gradient(z_used, dy_mm, dx_mm, edge_order=edge_order)
+    curv2_x = np.gradient(grad_x, dx_mm, axis=1, edge_order=edge_order)
+    curv2_y = np.gradient(grad_y, dy_mm, axis=0, edge_order=edge_order)
+    curve_x = curv2_x / np.power(1.0 + grad_x * grad_x, 1.5)
+    curve_y = curv2_y / np.power(1.0 + grad_y * grad_y, 1.5)
+
+    return {
+        "smoothed_height_mm": z_used,
+        "grad_x": grad_x,
+        "grad_y": grad_y,
+        "curv2_x": curv2_x,
+        "curv2_y": curv2_y,
+        "curve_x": curve_x,
+        "curve_y": curve_y,
+    }
+
+
+def save_csv(array: np.ndarray, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savetxt(str(path), array, delimiter=",", fmt="%.8f")
+
+
+def _percentile_limits(array: np.ndarray, lower: float = 2.0, upper: float = 98.0) -> Tuple[float, float]:
+    vmin = float(np.percentile(array, lower))
+    vmax = float(np.percentile(array, upper))
+    if np.isclose(vmin, vmax):
+        vmax = vmin + 1e-9
+    return vmin, vmax
+
+
+def save_preview_png(
+    array: np.ndarray,
+    path: Path,
+    cmap: str,
+    center_zero: bool,
+    title: str,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    fig, ax = plt.subplots(figsize=(10, 4), dpi=150)
+    if center_zero:
+        _, vmax_pct = _percentile_limits(np.abs(array), lower=2.0, upper=98.0)
+        vmax = max(vmax_pct, 1e-9)
+        norm = TwoSlopeNorm(vmin=-vmax, vcenter=0.0, vmax=vmax)
+        image = ax.imshow(array, cmap=cmap, norm=norm, aspect="auto")
+    else:
+        vmin, vmax = _percentile_limits(array)
+        image = ax.imshow(array, cmap=cmap, vmin=vmin, vmax=vmax, aspect="auto")
+
+    ax.set_title(title)
+    ax.set_xlabel("X pixel")
+    ax.set_ylabel("Y pixel")
+    fig.colorbar(image, ax=ax, shrink=0.8)
+    fig.tight_layout()
+    fig.savefig(str(path), bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_overview_png(output_dir: Path) -> None:
+    output_dir = Path(output_dir)
+    items = [
+        ("Raw Height", "height_raw_preview.png"),
+        ("Corrected Height", "height_corrected_preview.png"),
+        ("Resampled Height", "height_resampled_preview.png"),
+        ("Grad Y", "grad_y.png"),
+        ("Curv2 Y", "curv2_y.png"),
+        ("Curve Y", "curve_y.png"),
+    ]
+
+    cards = []
+    target_width = 560
+    for title, filename in items:
+        path = output_dir / filename
+        if not path.exists():
+            raise FileNotFoundError("Overview source image not found: {}".format(path))
+
+        image = Image.open(str(path)).convert("RGB")
+        resized_height = max(1, int(image.height * target_width / float(image.width)))
+        image = image.resize((target_width, resized_height))
+
+        card = Image.new("RGB", (target_width, resized_height + 40), "white")
+        card.paste(image, (0, 40))
+        draw = ImageDraw.Draw(card)
+        draw.text((10, 10), title, fill="black")
+        cards.append(card)
+
+    rows = []
+    for index in range(0, len(cards), 2):
+        left = cards[index]
+        right = cards[index + 1] if index + 1 < len(cards) else Image.new("RGB", left.size, "white")
+        row_height = max(left.height, right.height)
+        row = Image.new("RGB", (left.width + right.width + 20, row_height), (245, 245, 245))
+        row.paste(left, (0, 0))
+        row.paste(right, (left.width + 20, 0))
+        rows.append(row)
+
+    total_width = max(row.width for row in rows)
+    total_height = sum(row.height for row in rows) + 20 * (len(rows) - 1)
+    overview = Image.new("RGB", (total_width, total_height), (230, 230, 230))
+    y_offset = 0
+    for row in rows:
+        overview.paste(row, (0, y_offset))
+        y_offset += row.height + 20
+
+    overview.save(str(output_dir / "overview.png"))
+
+
+def process_heightmap(input_path: Path, output_dir: Path, config: ProcessingConfig) -> Dict[str, np.ndarray]:
+    gray = load_height_png(Path(input_path))
+    if gray.shape[0] != config.expected_height:
+        raise ValueError(
+            "Input image height {} does not match configured stripe layout {}.".format(
+                gray.shape[0], config.expected_height
+            )
+        )
+    if config.crop_left_px < 0 or config.crop_right_px < 0:
+        raise ValueError("Crop pixels must be non-negative.")
+    if config.crop_left_px + config.crop_right_px >= gray.shape[1]:
+        raise ValueError("Left/right crop removes the full image width.")
+
+    # 左右裁切发生在所有计算之前，用于切掉原图中不需要参与分析的区域。
+    # 裁切只影响 X 宽度，不改变扫描带高度与接缝位置。
+    x_start = config.crop_left_px
+    x_end = gray.shape[1] - config.crop_right_px if config.crop_right_px > 0 else gray.shape[1]
+    gray = gray[:, x_start:x_end]
+    if gray.shape[0] % config.downsample_factor != 0:
+        raise ValueError("Image height must be divisible by the downsample factor.")
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    raw_height_mm = gray.astype(np.float64) * config.dz_mm
+    corrected_height_mm, seam_offsets = correct_scan_band_offsets(
+        raw_height_mm,
+        stripe_height=config.stripe_height,
+        seam_window=config.seam_window,
+        transition_window=config.transition_window,
+        smooth_sigma_x=config.smooth_sigma_x,
+        seam_flatten_half_window=config.seam_flatten_half_window,
+        seam_flatten_sigma_x=config.seam_flatten_sigma_x,
+        seam_flatten_blend_width=config.seam_flatten_blend_width,
+        seam_flatten_method=config.seam_flatten_method,
+        num_stripes=config.num_stripes,
+    )
+    resampled_height_mm, resampled_dy_mm = downsample_y(
+        corrected_height_mm, factor=config.downsample_factor, dy_mm=config.dy_mm
+    )
+    maps = compute_surface_maps(
+        resampled_height_mm,
+        dx_mm=config.dx_mm,
+        dy_mm=resampled_dy_mm,
+        gaussian_sigma=config.gaussian_sigma,
+    )
+
+    save_preview_png(raw_height_mm, output_dir / "height_raw_preview.png", "viridis", False, "Raw Height (mm)")
+    save_preview_png(
+        corrected_height_mm,
+        output_dir / "height_corrected_preview.png",
+        "viridis",
+        False,
+        "Corrected Height (mm)",
+    )
+    save_preview_png(
+        resampled_height_mm,
+        output_dir / "height_resampled_preview.png",
+        "viridis",
+        False,
+        "Resampled Height (mm)",
+    )
+    save_float_tiff(corrected_height_mm, output_dir / "height_corrected_mm.tiff")
+    save_float_tiff(resampled_height_mm, output_dir / "height_resampled_mm.tiff")
+
+    for key in ("grad_x", "grad_y", "curv2_x", "curv2_y", "curve_x", "curve_y"):
+        save_csv(maps[key], output_dir / (key + ".csv"))
+        save_float_tiff(maps[key], output_dir / (key + ".tiff"))
+        save_preview_png(maps[key], output_dir / (key + ".png"), "coolwarm", True, key)
+
+    # 生成总览图，便于快速检查高度图修正前后以及 Y 向结果是否仍有接缝伪影。
+    save_overview_png(output_dir)
+
+    results = {
+        "raw_height_mm": raw_height_mm,
+        "corrected_height_mm": corrected_height_mm,
+        "resampled_height_mm": resampled_height_mm,
+        "seam_offsets": seam_offsets,
+        "resampled_dy_mm": np.array([resampled_dy_mm], dtype=np.float64),
+    }
+    results.update(maps)
+    return results
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="处理 16-bit 单通道光谱共焦 PNG 高度图，输出高度图、梯度图、曲率图。")
+    parser.add_argument("--input", type=Path, help="输入的 16-bit 单通道 PNG 高度图路径。")
+    parser.add_argument("--output-dir", type=Path, required=True, help="输出目录，PNG/CSV/TIFF 结果都会写入这里。")
+    parser.add_argument(
+        "--generate-synthetic",
+        action="store_true",
+        help="先生成一张假的高度图，再运行整条处理流程。",
+    )
+    parser.add_argument("--width", type=int, default=2048, help="假图宽度，单位像素。")
+    parser.add_argument("--stripe-height", type=int, default=2048, help="每一道扫描带的高度，单位像素。")
+    parser.add_argument("--num-stripes", type=int, default=3, help="扫描带数量。")
+    parser.add_argument("--downsample-factor", type=int, default=16, help="Y 方向分步采样倍率，例如 16 表示 16 行取一组平均。")
+    parser.add_argument("--dx-mm", type=float, default=0.08, help="X 方向物理分辨率，单位 mm/pixel。")
+    parser.add_argument("--dy-mm", type=float, default=0.005615, help="Y 方向物理分辨率，单位 mm/pixel。")
+    parser.add_argument("--dz-mm", type=float, default=0.0001, help="Z 方向高度分辨率，单位 mm/gray。")
+    parser.add_argument("--crop-left-px", type=int, default=0, help="处理前从图像左侧裁掉的像素数。")
+    parser.add_argument("--crop-right-px", type=int, default=0, help="处理前从图像右侧裁掉的像素数。")
+    parser.add_argument("--seam-window", type=int, default=64, help="估计每条接缝整带偏移时，接缝上下各取多少行。")
+    parser.add_argument(
+        "--transition-window",
+        type=int,
+        default=0,
+        help="旧版接缝过渡窗口参数，默认 0。当前主流程不再依赖这一步，保留仅为兼容。",
+    )
+    parser.add_argument(
+        "--smooth-sigma-x",
+        type=float,
+        default=2.0,
+        help="对逐列偏移 Δ(x) 做 X 向轻平滑的强度，值越大越平缓，但也更容易抹掉真实列间差异。",
+    )
+    parser.add_argument(
+        "--seam-flatten-half-window",
+        type=int,
+        default=2,
+        help="接缝窄带重建的半宽，单位是原始 Y 像素。默认只修 seam 附近极少几行，避免人为过渡带过宽。",
+    )
+    parser.add_argument(
+        "--seam-flatten-sigma-x",
+        type=float,
+        default=0.0,
+        help="接缝窄带重建时，对上下锚线做 X 向轻平滑的强度。默认关闭，优先保留真实列间差异。",
+    )
+    parser.add_argument(
+        "--seam-flatten-blend-width",
+        type=int,
+        default=0,
+        help="接缝核心带外侧的混合宽度。默认关闭，避免把修补区域扩展成可见的过渡带。",
+    )
+    parser.add_argument(
+        "--seam-flatten-method",
+        choices=["linear", "cubic"],
+        default="linear",
+        help="接缝窄带重建方法。linear 为旧版简单插值，通常更保守；cubic 为三次插值。",
+    )
+    parser.add_argument(
+        "--gaussian-sigma",
+        type=float,
+        default=0.8,
+        help="求导前对整图做轻量高斯平滑的强度，用于抑制噪声。",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = _build_arg_parser()
+    args = parser.parse_args(argv)
+
+    config = ProcessingConfig(
+        dx_mm=args.dx_mm,
+        dy_mm=args.dy_mm,
+        dz_mm=args.dz_mm,
+        stripe_height=args.stripe_height,
+        num_stripes=args.num_stripes,
+        downsample_factor=args.downsample_factor,
+        crop_left_px=args.crop_left_px,
+        crop_right_px=args.crop_right_px,
+        seam_window=args.seam_window,
+        transition_window=args.transition_window,
+        smooth_sigma_x=args.smooth_sigma_x,
+        seam_flatten_half_window=args.seam_flatten_half_window,
+        seam_flatten_sigma_x=args.seam_flatten_sigma_x,
+        seam_flatten_blend_width=args.seam_flatten_blend_width,
+        seam_flatten_method=args.seam_flatten_method,
+        gaussian_sigma=args.gaussian_sigma,
+    )
+
+    output_dir = Path(args.output_dir)
+    input_path = args.input
+    if args.generate_synthetic:
+        synthetic = generate_synthetic_heightmap(
+            width=args.width,
+            stripe_height=args.stripe_height,
+            num_stripes=args.num_stripes,
+            dz_mm=args.dz_mm,
+        )
+        output_dir.mkdir(parents=True, exist_ok=True)
+        input_path = output_dir / "synthetic_input.png"
+        save_height_png(synthetic, input_path)
+    elif input_path is None:
+        parser.error("请通过 --input 指定输入 PNG，或使用 --generate-synthetic 生成假图。")
+
+    process_heightmap(input_path, output_dir, config)
+    print("处理完成，结果已输出到 {}".format(output_dir))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
