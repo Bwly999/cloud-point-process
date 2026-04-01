@@ -6,6 +6,7 @@ import numpy as np
 
 from cloud_point_process.processor import (
     ProcessingConfig,
+    _estimate_window_slope,
     compute_surface_maps,
     correct_scan_band_offsets,
     downsample_y,
@@ -17,6 +18,35 @@ from cloud_point_process.processor import (
 
 
 class TestPointCloudProcessor(unittest.TestCase):
+    def test_estimate_window_slope_ignores_seam_side_spikes(self):
+        stripe_height = 64
+        width = 96
+        y, x = np.indices((stripe_height * 3, width), dtype=np.float64)
+        image = 0.0008 * np.minimum(y, stripe_height) + 0.0032 * np.maximum(y - stripe_height, 0)
+        image += 0.01 * np.sin(x / 10.0)
+
+        seam_y = stripe_height
+        phase = np.arange(width, dtype=np.float64) / 4.0
+        frac = phase - np.floor(phase)
+        triangle = 2.0 * np.abs(2.0 * frac - 1.0) - 1.0
+        for row in range(seam_y - 2, seam_y + 3):
+            weight = 1.0 - 0.2 * abs(row - seam_y)
+            image[row, :] += 0.05 * triangle * weight
+
+        centered_top = 0.5 * (image[seam_y - 2, :] - image[seam_y - 4, :])
+        outward_top = _estimate_window_slope(image, seam_y - 5, seam_y - 2)
+        centered_bottom = 0.5 * (image[seam_y + 3, :] - image[seam_y + 1, :])
+        outward_bottom = _estimate_window_slope(image, seam_y + 2, seam_y + 5)
+
+        true_top = np.full(width, 0.0008, dtype=np.float64)
+        true_bottom = np.full(width, 0.0032, dtype=np.float64)
+
+        self.assertLess(np.median(np.abs(outward_top - true_top)), np.median(np.abs(centered_top - true_top)))
+        self.assertLess(
+            np.median(np.abs(outward_bottom - true_bottom)),
+            np.median(np.abs(centered_bottom - true_bottom)),
+        )
+
     def test_generate_synthetic_heightmap_returns_uint16_image(self):
         image = generate_synthetic_heightmap(width=64, stripe_height=32, num_stripes=3)
 
@@ -297,6 +327,90 @@ class TestPointCloudProcessor(unittest.TestCase):
         seam_grad_after = np.median(np.abs(np.gradient(flattened, axis=0))[stripe_height - 1:stripe_height + 1, :])
         self.assertLess(seam_grad_after, seam_grad_before)
 
+    def test_quadratic_mode_keeps_curve_y_smoother_than_linear_at_seam(self):
+        stripe_height = 128
+        width = 256
+        y, x = np.indices((stripe_height * 3, width), dtype=np.float64)
+        base = 0.02 * np.sin(x / 11.0) + 0.008 * np.cos(y / 9.0) + 0.0015 * x + 0.0007 * y
+        phase = np.arange(width, dtype=np.float64) / 4.0
+        frac = phase - np.floor(phase)
+        triangle = 2.0 * np.abs(2.0 * frac - 1.0) - 1.0
+
+        image = base.copy()
+        seam_y = stripe_height
+        for row in range(seam_y - 3, seam_y + 4):
+            weight = 1.0 - 0.18 * abs(row - seam_y)
+            image[row, :] += 0.10 * triangle * weight
+
+        flattened_linear = flatten_seam_artifacts(
+            image,
+            stripe_height=stripe_height,
+            num_stripes=3,
+            half_window=2,
+            sigma_x=0.0,
+            blend_width=0,
+            method="linear",
+        )
+        flattened_quadratic = flatten_seam_artifacts(
+            image,
+            stripe_height=stripe_height,
+            num_stripes=3,
+            half_window=2,
+            sigma_x=0.0,
+            blend_width=0,
+            method="quadratic",
+        )
+
+        linear_resampled, dy_mm = downsample_y(flattened_linear, factor=8, dy_mm=0.5)
+        quadratic_resampled, _ = downsample_y(flattened_quadratic, factor=8, dy_mm=0.5)
+        linear_maps = compute_surface_maps(linear_resampled, dx_mm=0.8, dy_mm=dy_mm, gaussian_sigma=0.8)
+        quadratic_maps = compute_surface_maps(quadratic_resampled, dx_mm=0.8, dy_mm=dy_mm, gaussian_sigma=0.8)
+
+        seam_row = seam_y // 8
+        linear_curve = linear_maps["curve_y"][seam_row, :]
+        quadratic_curve = quadratic_maps["curve_y"][seam_row, :]
+        linear_roughness = np.median(np.abs(np.diff(linear_curve)))
+        quadratic_roughness = np.median(np.abs(np.diff(quadratic_curve)))
+        linear_magnitude = np.median(np.abs(linear_curve))
+        quadratic_magnitude = np.median(np.abs(quadratic_curve))
+
+        self.assertLessEqual(quadratic_roughness, linear_roughness * 1.02)
+        self.assertLessEqual(quadratic_magnitude, linear_magnitude * 1.05)
+
+    def test_quadratic_mode_preserves_boundary_slope_order(self):
+        stripe_height = 64
+        width = 128
+        y, x = np.indices((stripe_height * 3, width), dtype=np.float64)
+        base = 0.0008 * np.minimum(y, stripe_height) + 0.0032 * np.maximum(y - stripe_height, 0)
+        base += 0.01 * np.sin(x / 10.0)
+
+        image = base.copy()
+        seam_y = stripe_height
+        phase = np.arange(width, dtype=np.float64) / 4.0
+        frac = phase - np.floor(phase)
+        triangle = 2.0 * np.abs(2.0 * frac - 1.0) - 1.0
+        for row in range(seam_y - 2, seam_y + 3):
+            weight = 1.0 - 0.2 * abs(row - seam_y)
+            image[row, :] += 0.05 * triangle * weight
+
+        flattened = flatten_seam_artifacts(
+            image,
+            stripe_height=stripe_height,
+            num_stripes=3,
+            half_window=2,
+            sigma_x=0.0,
+            blend_width=0,
+            method="quadratic",
+        )
+
+        core_start = seam_y - 2
+        core_end = seam_y + 2
+        top_local_slope = flattened[core_start, :] - flattened[core_start - 1, :]
+        bottom_local_slope = flattened[core_end, :] - flattened[core_end - 1, :]
+
+        self.assertLess(np.median(top_local_slope), np.median(bottom_local_slope))
+        self.assertGreaterEqual(np.mean(top_local_slope <= bottom_local_slope), 0.7)
+
     def test_process_heightmap_exports_png_and_csv(self):
         config = ProcessingConfig(
             dx_mm=0.08,
@@ -329,23 +443,30 @@ class TestPointCloudProcessor(unittest.TestCase):
                 "overview.png",
                 "height_corrected_mm.tiff",
                 "height_resampled_mm.tiff",
+                "height_resampled_xyz.csv",
                 "grad_x.png",
                 "grad_x.csv",
+                "grad_x_xyz.csv",
                 "grad_x.tiff",
                 "grad_y.png",
                 "grad_y.csv",
+                "grad_y_xyz.csv",
                 "grad_y.tiff",
                 "curv2_x.png",
                 "curv2_x.csv",
+                "curv2_x_xyz.csv",
                 "curv2_x.tiff",
                 "curv2_y.png",
                 "curv2_y.csv",
+                "curv2_y_xyz.csv",
                 "curv2_y.tiff",
                 "curve_x.png",
                 "curve_x.csv",
+                "curve_x_xyz.csv",
                 "curve_x.tiff",
                 "curve_y.png",
                 "curve_y.csv",
+                "curve_y_xyz.csv",
                 "curve_y.tiff",
             ]
 
@@ -354,6 +475,23 @@ class TestPointCloudProcessor(unittest.TestCase):
 
             self.assertEqual(results["raw_height_mm"].shape, (96, 64))
             self.assertEqual(results["resampled_height_mm"].shape, (24, 64))
+
+            xyz = np.loadtxt(output_dir / "height_resampled_xyz.csv", delimiter=",", skiprows=1)
+            self.assertEqual(xyz.shape, (24 * 64, 3))
+            np.testing.assert_allclose(xyz[0], [0.0, 0.0, results["resampled_height_mm"][0, 0]], atol=1e-8)
+            np.testing.assert_allclose(
+                xyz[-1],
+                [
+                    (results["resampled_height_mm"].shape[1] - 1) * config.dx_mm,
+                    (results["resampled_height_mm"].shape[0] - 1) * (config.dy_mm * config.downsample_factor),
+                    results["resampled_height_mm"][-1, -1],
+                ],
+                atol=1e-8,
+            )
+
+            grad_xyz = np.loadtxt(output_dir / "grad_y_xyz.csv", delimiter=",", skiprows=1)
+            self.assertEqual(grad_xyz.shape, (24 * 64, 3))
+            np.testing.assert_allclose(grad_xyz[0], [0.0, 0.0, results["grad_y"][0, 0]], atol=1e-8)
 
     def test_process_heightmap_supports_left_right_crop(self):
         config = ProcessingConfig(

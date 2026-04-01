@@ -145,6 +145,24 @@ def _estimate_row_slope(image: np.ndarray, row: int) -> np.ndarray:
     return 0.5 * (image[row + 1, :] - image[row - 1, :])
 
 
+def _estimate_window_slope(image: np.ndarray, row_start: int, row_end: int) -> np.ndarray:
+    row_start = max(0, row_start)
+    row_end = min(image.shape[0] - 1, row_end)
+    if row_end <= row_start:
+        return np.zeros(image.shape[1], dtype=np.float64)
+
+    rows = np.arange(row_start, row_end + 1, dtype=np.float64)
+    values = image[row_start:row_end + 1, :].astype(np.float64)
+    row_mean = rows.mean()
+    centered_rows = rows - row_mean
+    denom = np.sum(centered_rows * centered_rows)
+    if denom <= 0:
+        return np.zeros(image.shape[1], dtype=np.float64)
+
+    value_mean = values.mean(axis=0)
+    return np.sum(centered_rows[:, np.newaxis] * (values - value_mean), axis=0) / denom
+
+
 def correct_scan_band_offsets(
     z_mm: np.ndarray,
     stripe_height: int,
@@ -256,8 +274,9 @@ def flatten_seam_artifacts(
 
         top_line = flattened[top_anchor, :].copy()
         bottom_line = flattened[bottom_anchor, :].copy()
-        top_slope = _estimate_row_slope(flattened, top_anchor)
-        bottom_slope = _estimate_row_slope(flattened, bottom_anchor)
+        slope_window = max(4, half_window + 4)
+        top_slope = _estimate_window_slope(flattened, top_anchor - slope_window + 1, top_anchor)
+        bottom_slope = _estimate_window_slope(flattened, bottom_anchor, bottom_anchor + slope_window - 1)
         if sigma_x > 0:
             top_line = gaussian_filter1d(top_line, sigma=sigma_x, mode="nearest")
             bottom_line = gaussian_filter1d(bottom_line, sigma=sigma_x, mode="nearest")
@@ -276,13 +295,20 @@ def flatten_seam_artifacts(
             if method == "linear":
                 rebuilt = top_line * (1.0 - t) + bottom_line * t
             elif method == "quadratic":
-                # 使用固定二阶导风格的过渡：令过渡曲线为二次函数，
-                # 满足上边界高度、下边界高度以及上边界一阶导约束。
-                # 这样斜率会沿 Y 方向均匀变化，比 linear 更柔和，
-                # 同时又比 cubic 更克制。
-                a = (bottom_line - top_line - top_slope * span) / (span * span)
+                # quadratic 模式要求每个 X 列都保持常二阶导，并让
+                # 斜率沿 Y 方向做均匀变化。这里先由上下锚点高度确定
+                # 割线斜率，再用上下边界斜率差来决定“从低到高”的
+                # 线性变化幅度。这样既保持高度约束，又不会把原本
+                # 低梯度的一侧抬高、高梯度的一侧压低到反转。
+                effective_sigma_x = max(float(sigma_x), 2.0)
+                secant_slope = (bottom_line - top_line) / span
+                secant_slope = gaussian_filter1d(secant_slope, sigma=effective_sigma_x, mode="nearest")
+                slope_delta = bottom_slope - top_slope
+                slope_delta = gaussian_filter1d(slope_delta, sigma=effective_sigma_x, mode="nearest")
+                top_rebuilt_slope = secant_slope - 0.5 * slope_delta
+                a = 0.5 * slope_delta / span
                 delta = row - top_anchor
-                rebuilt = a * delta * delta + top_slope * delta + top_line
+                rebuilt = a * delta * delta + top_rebuilt_slope * delta + top_line
             else:
                 h00 = 2.0 * t * t * t - 3.0 * t * t + 1.0
                 h10 = t * t * t - 2.0 * t * t + t
@@ -370,6 +396,16 @@ def compute_surface_maps(
 def save_csv(array: np.ndarray, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savetxt(str(path), array, delimiter=",", fmt="%.8f")
+
+
+def save_xyz_csv(array: np.ndarray, dx_mm: float, dy_mm: float, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    height, width = array.shape
+    x_coords = np.arange(width, dtype=np.float64) * dx_mm
+    y_coords = np.arange(height, dtype=np.float64) * dy_mm
+    xx, yy = np.meshgrid(x_coords, y_coords)
+    xyz = np.column_stack([xx.ravel(), yy.ravel(), array.astype(np.float64, copy=False).ravel()])
+    np.savetxt(str(path), xyz, delimiter=",", fmt="%.8f", header="X,Y,Z", comments="")
 
 
 def _percentile_limits(array: np.ndarray, lower: float = 2.0, upper: float = 98.0) -> Tuple[float, float]:
@@ -522,9 +558,16 @@ def process_heightmap(input_path: Path, output_dir: Path, config: ProcessingConf
     )
     save_float_tiff(corrected_height_mm, output_dir / "height_corrected_mm.tiff")
     save_float_tiff(resampled_height_mm, output_dir / "height_resampled_mm.tiff")
+    save_xyz_csv(
+        resampled_height_mm,
+        dx_mm=config.dx_mm,
+        dy_mm=resampled_dy_mm,
+        path=output_dir / "height_resampled_xyz.csv",
+    )
 
     for key in ("grad_x", "grad_y", "curv2_x", "curv2_y", "curve_x", "curve_y"):
         save_csv(maps[key], output_dir / (key + ".csv"))
+        save_xyz_csv(maps[key], dx_mm=config.dx_mm, dy_mm=resampled_dy_mm, path=output_dir / (key + "_xyz.csv"))
         save_float_tiff(maps[key], output_dir / (key + ".tiff"))
         save_preview_png(maps[key], output_dir / (key + ".png"), "coolwarm", True, key)
 

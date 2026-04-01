@@ -8,6 +8,7 @@
 - `X/Y` 方向二阶导图
 - `X/Y` 方向剖面曲率图
 - `PNG / CSV / TIFF` 三类结果文件
+- 额外导出 `X,Y,Z` 三列点表 CSV
 - 一张用于快速检查效果的总览图 `overview.png`
 
 ## 输入假设
@@ -131,21 +132,31 @@ python package_zip.py --output my-release.zip
 - `height_resampled_preview.png`
 - `height_corrected_mm.tiff`
 - `height_resampled_mm.tiff`
+- `height_resampled_xyz.csv`
 
 ### 梯度图
 
 - `grad_x.png` / `grad_x.csv` / `grad_x.tiff`
 - `grad_y.png` / `grad_y.csv` / `grad_y.tiff`
+- `grad_x_xyz.csv` / `grad_y_xyz.csv`
 
 ### 二阶导图
 
 - `curv2_x.png` / `curv2_x.csv` / `curv2_x.tiff`
 - `curv2_y.png` / `curv2_y.csv` / `curv2_y.tiff`
+- `curv2_x_xyz.csv` / `curv2_y_xyz.csv`
 
 ### 剖面曲率图
 
 - `curve_x.png` / `curve_x.csv` / `curve_x.tiff`
 - `curve_y.png` / `curve_y.csv` / `curve_y.tiff`
+- `curve_x_xyz.csv` / `curve_y_xyz.csv`
+
+其中新增的 `*_xyz.csv` 统一为三列：
+
+- `X`：物理 `X` 坐标，单位 `mm`
+- `Y`：物理 `Y` 坐标，单位 `mm`
+- `Z`：该点对应的高度、梯度或曲率数值
 
 ### 总览图
 
