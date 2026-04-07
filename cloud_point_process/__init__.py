@@ -1,5 +1,6 @@
 from .processor import (
     ProcessingConfig,
+    compute_resampled_surface_maps,
     compute_surface_maps,
     correct_scan_band_offsets,
     downsample_y,
@@ -10,6 +11,7 @@ from .processor import (
 
 __all__ = [
     "ProcessingConfig",
+    "compute_resampled_surface_maps",
     "compute_surface_maps",
     "correct_scan_band_offsets",
     "downsample_y",

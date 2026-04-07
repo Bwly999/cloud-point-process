@@ -32,7 +32,7 @@ class ProcessingConfig:
     seam_flatten_blend_width: int = 0
     seam_flatten_method: str = "linear"
     pre_smooth_x_sigma: float = 0.0
-    gaussian_sigma: float = 0.8
+    gaussian_sigma: float = 0.064
     crop_left_px: int = 0
     crop_right_px: int = 0
 
@@ -355,11 +355,24 @@ def downsample_y(z_mm: np.ndarray, factor: int, dy_mm: float) -> Tuple[np.ndarra
     return reshaped.mean(axis=1), dy_mm * factor
 
 
+def sample_y_block_centers(array: np.ndarray, factor: int, dy_mm: float) -> Tuple[np.ndarray, float]:
+    if factor <= 0:
+        raise ValueError("Downsample factor must be positive.")
+    if array.shape[0] % factor != 0:
+        raise ValueError("Image height must be divisible by the downsample factor.")
+    if factor == 1:
+        return array.copy(), dy_mm
+
+    indices = np.arange(array.shape[0] // factor, dtype=np.int64) * factor + (factor // 2)
+    indices = np.clip(indices, 0, array.shape[0] - 1)
+    return array[indices, :].copy(), dy_mm * factor
+
+
 def compute_surface_maps(
     z_mm: np.ndarray,
     dx_mm: float,
     dy_mm: float,
-    gaussian_sigma: float = 0.8,
+    gaussian_sigma: float = 0.064,
     pre_smooth_x_sigma: float = 0.0,
 ) -> Dict[str, np.ndarray]:
     if z_mm.ndim != 2:
@@ -367,13 +380,17 @@ def compute_surface_maps(
 
     z_used = z_mm.astype(np.float64, copy=True)
 
-    # 仅在 X 方向做轻量平滑，用来压制列间高频条纹。这个步骤发生在
-    # 求导前，主要影响 grad_x / curv2_x / curve_x，对 Y 向结果影响很小。
+    # 仅在 X 方向做轻量平滑，用来压制列间高频条纹。sigma 使用物理
+    # 长度 mm 表示，再按 dx 换算成像素，避免采样率变化时平滑宽度失真。
     if pre_smooth_x_sigma > 0:
-        z_used = gaussian_filter1d(z_used, sigma=pre_smooth_x_sigma, axis=1, mode="nearest")
+        sigma_x_px = pre_smooth_x_sigma / dx_mm
+        z_used = gaussian_filter1d(z_used, sigma=sigma_x_px, axis=1, mode="nearest")
 
+    # 各向平滑同样以物理长度 mm 定义，再分别按 dy/dx 换算成像素。
     if gaussian_sigma > 0:
-        z_used = gaussian_filter(z_used, sigma=gaussian_sigma, mode="nearest")
+        sigma_y_px = gaussian_sigma / dy_mm
+        sigma_x_px = gaussian_sigma / dx_mm
+        z_used = gaussian_filter(z_used, sigma=(sigma_y_px, sigma_x_px), mode="nearest")
 
     edge_order = 2 if min(z_used.shape) >= 3 else 1
     grad_y, grad_x = np.gradient(z_used, dy_mm, dx_mm, edge_order=edge_order)
@@ -391,6 +408,36 @@ def compute_surface_maps(
         "curve_x": curve_x,
         "curve_y": curve_y,
     }
+
+
+def compute_resampled_surface_maps(
+    z_mm: np.ndarray,
+    dx_mm: float,
+    dy_mm: float,
+    downsample_factor: int,
+    gaussian_sigma: float = 0.064,
+    pre_smooth_x_sigma: float = 0.0,
+) -> Tuple[Dict[str, np.ndarray], float]:
+    full_resolution_maps = compute_surface_maps(
+        z_mm,
+        dx_mm=dx_mm,
+        dy_mm=dy_mm,
+        gaussian_sigma=gaussian_sigma,
+        pre_smooth_x_sigma=pre_smooth_x_sigma,
+    )
+
+    resampled_maps: Dict[str, np.ndarray] = {}
+    resampled_dy_mm = dy_mm
+    for key, value in full_resolution_maps.items():
+        resampled_value, current_resampled_dy_mm = sample_y_block_centers(
+            value,
+            factor=downsample_factor,
+            dy_mm=dy_mm,
+        )
+        resampled_maps[key] = resampled_value
+        resampled_dy_mm = current_resampled_dy_mm
+
+    return resampled_maps, resampled_dy_mm
 
 
 def save_csv(array: np.ndarray, path: Path) -> None:
@@ -530,13 +577,12 @@ def process_heightmap(input_path: Path, output_dir: Path, config: ProcessingConf
         seam_flatten_method=config.seam_flatten_method,
         num_stripes=config.num_stripes,
     )
-    resampled_height_mm, resampled_dy_mm = downsample_y(
-        corrected_height_mm, factor=config.downsample_factor, dy_mm=config.dy_mm
-    )
-    maps = compute_surface_maps(
-        resampled_height_mm,
+    resampled_height_mm, _ = downsample_y(corrected_height_mm, factor=config.downsample_factor, dy_mm=config.dy_mm)
+    maps, resampled_dy_mm = compute_resampled_surface_maps(
+        corrected_height_mm,
         dx_mm=config.dx_mm,
-        dy_mm=resampled_dy_mm,
+        dy_mm=config.dy_mm,
+        downsample_factor=config.downsample_factor,
         gaussian_sigma=config.gaussian_sigma,
         pre_smooth_x_sigma=config.pre_smooth_x_sigma,
     )
@@ -644,13 +690,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--pre-smooth-x-sigma",
         type=float,
         default=0.0,
-        help="求导前仅对 X 方向做轻量高斯平滑，用于抑制 grad_x 中的纵向条纹。",
+        help="求导前仅对 X 方向做轻量高斯平滑，单位 mm，用于抑制 grad_x 中的纵向条纹。",
     )
     parser.add_argument(
         "--gaussian-sigma",
         type=float,
-        default=0.8,
-        help="求导前对整图做轻量高斯平滑的强度，用于抑制噪声。",
+        default=0.064,
+        help="求导前对整图做轻量高斯平滑的物理尺度，单位 mm，用于抑制噪声。",
     )
     return parser
 

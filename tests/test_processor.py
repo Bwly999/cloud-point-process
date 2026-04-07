@@ -3,10 +3,12 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+from scipy.ndimage import gaussian_filter
 
 from cloud_point_process.processor import (
     ProcessingConfig,
     _estimate_window_slope,
+    compute_resampled_surface_maps,
     compute_surface_maps,
     correct_scan_band_offsets,
     downsample_y,
@@ -118,6 +120,53 @@ class TestPointCloudProcessor(unittest.TestCase):
         np.testing.assert_allclose(maps["curve_x"], 0.0, atol=1e-10)
         np.testing.assert_allclose(maps["curve_y"], 0.0, atol=1e-10)
 
+    def test_compute_resampled_surface_maps_keeps_curve_y_stable_across_downsample_factors(self):
+        dx = 0.08
+        dy = 0.005615
+        width = 24
+        height = 4096
+        y = np.arange(height, dtype=np.float64) * dy
+        profile = 0.05 * np.sin(2.0 * np.pi * y / 0.3)
+        z = np.repeat(profile[:, np.newaxis], width, axis=1)
+
+        maps_factor_1, resampled_dy_1 = compute_resampled_surface_maps(
+            z,
+            dx_mm=dx,
+            dy_mm=dy,
+            downsample_factor=1,
+            gaussian_sigma=0.064,
+        )
+        maps_factor_8, resampled_dy_8 = compute_resampled_surface_maps(
+            z,
+            dx_mm=dx,
+            dy_mm=dy,
+            downsample_factor=8,
+            gaussian_sigma=0.064,
+        )
+
+        self.assertEqual(resampled_dy_1, dy)
+        self.assertEqual(resampled_dy_8, dy * 8)
+
+        grad_y_max_1 = float(np.percentile(np.abs(maps_factor_1["grad_y"]), 95))
+        grad_y_max_8 = float(np.percentile(np.abs(maps_factor_8["grad_y"]), 95))
+        curve_y_max_1 = float(np.percentile(np.abs(maps_factor_1["curve_y"]), 95))
+        curve_y_max_8 = float(np.percentile(np.abs(maps_factor_8["curve_y"]), 95))
+
+        self.assertLess(abs(grad_y_max_8 - grad_y_max_1) / grad_y_max_1, 0.1)
+        self.assertLess(abs(curve_y_max_8 - curve_y_max_1) / curve_y_max_1, 0.1)
+
+    def test_compute_surface_maps_uses_gaussian_sigma_in_physical_mm(self):
+        dx = 0.08
+        dy = 0.005615
+        sigma_mm = 0.08
+        y, x = np.indices((96, 64), dtype=np.float64)
+        z = 0.03 * np.sin(x / 5.0) + 0.04 * np.cos(y / 9.0) + 0.002 * y
+
+        maps = compute_surface_maps(z, dx_mm=dx, dy_mm=dy, gaussian_sigma=sigma_mm)
+        expected = gaussian_filter(z, sigma=(sigma_mm / dy, sigma_mm / dx), mode="nearest")
+
+        np.testing.assert_allclose(maps["smoothed_height_mm"], expected, rtol=1e-10, atol=1e-10)
+
     def test_pre_smooth_x_sigma_reduces_vertical_stripes_in_grad_x(self):
         width = 96
         height = 72
@@ -137,7 +186,7 @@ class TestPointCloudProcessor(unittest.TestCase):
             dx_mm=0.08,
             dy_mm=0.08,
             gaussian_sigma=0.0,
-            pre_smooth_x_sigma=0.8,
+            pre_smooth_x_sigma=0.064,
         )
 
         raw_grad_x = np.median(np.abs(raw_maps["grad_x"]))
@@ -168,7 +217,7 @@ class TestPointCloudProcessor(unittest.TestCase):
             smooth_sigma_x=2.0,
         )
         resampled, dy_mm = downsample_y(corrected, factor=4, dy_mm=0.5)
-        maps = compute_surface_maps(resampled, dx_mm=0.8, dy_mm=dy_mm, gaussian_sigma=0.8)
+        maps = compute_surface_maps(resampled, dx_mm=0.8, dy_mm=dy_mm, gaussian_sigma=0.064)
 
         for seam in (stripe_height, stripe_height * 2):
             seam_row = seam // 4
@@ -222,7 +271,7 @@ class TestPointCloudProcessor(unittest.TestCase):
             smooth_sigma_x=config.smooth_sigma_x,
         )
         resampled, dy_mm = downsample_y(corrected, factor=8, dy_mm=0.5)
-        maps = compute_surface_maps(resampled, dx_mm=0.8, dy_mm=dy_mm, gaussian_sigma=0.8)
+        maps = compute_surface_maps(resampled, dx_mm=0.8, dy_mm=dy_mm, gaussian_sigma=0.064)
 
         for seam in (stripe_height, stripe_height * 2):
             seam_row = seam // 8
@@ -363,8 +412,8 @@ class TestPointCloudProcessor(unittest.TestCase):
 
         linear_resampled, dy_mm = downsample_y(flattened_linear, factor=8, dy_mm=0.5)
         quadratic_resampled, _ = downsample_y(flattened_quadratic, factor=8, dy_mm=0.5)
-        linear_maps = compute_surface_maps(linear_resampled, dx_mm=0.8, dy_mm=dy_mm, gaussian_sigma=0.8)
-        quadratic_maps = compute_surface_maps(quadratic_resampled, dx_mm=0.8, dy_mm=dy_mm, gaussian_sigma=0.8)
+        linear_maps = compute_surface_maps(linear_resampled, dx_mm=0.8, dy_mm=dy_mm, gaussian_sigma=0.064)
+        quadratic_maps = compute_surface_maps(quadratic_resampled, dx_mm=0.8, dy_mm=dy_mm, gaussian_sigma=0.064)
 
         seam_row = seam_y // 8
         linear_curve = linear_maps["curve_y"][seam_row, :]
@@ -423,7 +472,7 @@ class TestPointCloudProcessor(unittest.TestCase):
             transition_window=4,
             smooth_sigma_x=2.0,
             seam_flatten_blend_width=1,
-            gaussian_sigma=0.8,
+            gaussian_sigma=0.064,
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:
