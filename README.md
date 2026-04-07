@@ -26,10 +26,11 @@
 2. 逐列估计每条接缝的整带偏移 `Δ(x)`
 3. 按扫描带做整带基线补偿
 4. 在原始高分辨率图上，对接缝窄带做局部重建，压掉 seam-local 锯齿
-5. 在原始物理网格上做轻平滑并计算梯度、二阶导和剖面曲率
-6. 沿 `Y` 方向做分步重采样，用于导出高度图和导数结果图
-7. 导出 `PNG / CSV / TIFF`
-8. 生成 `overview.png`
+5. 可选地对高度图做离群噪点滤除，压掉孤立尖刺和小团簇异常
+6. 在原始物理网格上做轻平滑并计算梯度、二阶导和剖面曲率
+7. 沿 `Y` 方向做分步重采样，用于导出高度图和导数结果图
+8. 导出 `PNG / CSV / TIFF`
+9. 生成 `overview.png`
 
 ## 常用命令
 
@@ -55,6 +56,30 @@ python process_heightmap.py ^
   --output-dir out ^
   --crop-left-px 120 ^
   --crop-right-px 80
+```
+
+### 4. 处理真实图并启用离群噪点滤除
+
+```bash
+python process_heightmap.py ^
+  --input your.png ^
+  --output-dir out ^
+  --outlier-filter-mode medium ^
+  --outlier-window-size 5 ^
+  --outlier-threshold-mm 0.02 ^
+  --outlier-max-cluster-size 4
+```
+
+### 5. 生成带尖刺/小团簇噪点的假图
+
+```bash
+python process_heightmap.py ^
+  --generate-synthetic ^
+  --output-dir noisy_demo ^
+  --synthetic-outlier-spike-count 12 ^
+  --synthetic-outlier-cluster-count 2 ^
+  --synthetic-outlier-cluster-size 2 ^
+  --synthetic-outlier-amplitude-mm 0.08
 ```
 
 ### 4. 只打包代码和文档为 zip
@@ -128,6 +153,41 @@ python package_zip.py --output my-release.zip
 
 这两个参数现在都按物理长度 `mm` 定义，而不是像素单位。
 这样在不同 `downsample` 下，平滑尺度会保持一致，不会因为采样率变化而把曲率额外压小。
+
+### 离群噪点滤除
+
+- `--outlier-filter-mode`
+  - `off` 关闭，默认值
+  - `conservative` 主要处理单像素尖刺
+  - `medium` 在单点基础上，额外处理小团簇离群点
+- `--outlier-window-size`
+  - 局部中值窗口尺寸，必须是奇数
+  - 设为 `0` 时，按模式使用默认值
+- `--outlier-threshold-mm`
+  - 像素相对局部中值的离群阈值，单位 `mm`
+  - 设为 `0` 时，按模式使用默认值
+- `--outlier-max-cluster-size`
+  - 允许被替换的小连通域最大面积，单位像素
+  - 设为 `0` 时，按模式使用默认值
+- `--outlier-replace-mode`
+  - 当前仅支持 `median`
+
+默认模式参数：
+
+- `conservative`
+  - `window_size = 3`
+  - `threshold_mm = 0.02`
+  - `max_cluster_size = 1`
+- `medium`
+  - `window_size = 5`
+  - `threshold_mm = 0.01`
+  - `max_cluster_size = 4`
+
+建议：
+
+- 如果真实表面上存在少量突兀飞点，先试 `conservative`
+- 如果异常表现为 `2x2`、`3x3` 一类的小块噪点，再试 `medium`
+- 阈值越小、连通域面积越大，滤除越激进，也越容易抹掉真实尖峰细节
 
 ## 输出文件
 

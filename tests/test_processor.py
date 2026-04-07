@@ -197,6 +197,108 @@ class TestPointCloudProcessor(unittest.TestCase):
         self.assertLess(smooth_grad_x, raw_grad_x * 0.75)
         np.testing.assert_allclose(smooth_grad_y, raw_grad_y, rtol=0.05, atol=1e-6)
 
+    def test_outlier_filter_off_preserves_height_without_gaussian(self):
+        y, x = np.indices((24, 20), dtype=np.float64)
+        z = 0.002 * x + 0.003 * y + 0.01 * np.sin(x / 5.0)
+
+        maps = compute_surface_maps(
+            z,
+            dx_mm=0.08,
+            dy_mm=0.08,
+            gaussian_sigma=0.0,
+            outlier_filter_mode="off",
+        )
+
+        np.testing.assert_allclose(maps["smoothed_height_mm"], z, atol=1e-12)
+
+    def test_conservative_outlier_filter_replaces_isolated_spikes(self):
+        height = 48
+        width = 40
+        y, x = np.indices((height, width), dtype=np.float64)
+        base = 0.0015 * x + 0.0025 * y + 0.006 * np.sin(x / 7.0)
+        z = base.copy()
+        spikes = [(10, 8, 0.09), (20, 24, -0.08), (33, 15, 0.07)]
+        for row, col, delta in spikes:
+            z[row, col] += delta
+
+        raw_maps = compute_surface_maps(
+            z,
+            dx_mm=0.08,
+            dy_mm=0.08,
+            gaussian_sigma=0.0,
+            outlier_filter_mode="off",
+        )
+        filtered_maps = compute_surface_maps(
+            z,
+            dx_mm=0.08,
+            dy_mm=0.08,
+            gaussian_sigma=0.0,
+            outlier_filter_mode="conservative",
+            outlier_window_size=3,
+            outlier_threshold_mm=0.03,
+            outlier_max_cluster_size=1,
+        )
+
+        stable_mask = np.ones_like(z, dtype=bool)
+        for row, col, _ in spikes:
+            stable_mask[max(0, row - 1):min(height, row + 2), max(0, col - 1):min(width, col + 2)] = False
+            raw_peak = float(
+                np.max(np.abs(raw_maps["grad_x"][max(0, row - 1):min(height, row + 2), max(0, col - 1):min(width, col + 2)]))
+            )
+            filtered_peak = float(
+                np.max(
+                    np.abs(
+                        filtered_maps["grad_x"][
+                            max(0, row - 1):min(height, row + 2),
+                            max(0, col - 1):min(width, col + 2),
+                        ]
+                    )
+                )
+            )
+            self.assertLess(filtered_peak, raw_peak * 0.1)
+            self.assertLess(
+                abs(filtered_maps["smoothed_height_mm"][row, col] - base[row, col]),
+                abs(z[row, col] - base[row, col]) * 0.1,
+            )
+
+        np.testing.assert_allclose(filtered_maps["smoothed_height_mm"][stable_mask], z[stable_mask], atol=1e-12)
+
+    def test_medium_outlier_filter_removes_small_clusters_beyond_conservative(self):
+        y, x = np.indices((40, 40), dtype=np.float64)
+        base = 0.002 * x + 0.001 * y + 0.004 * np.cos(y / 6.0)
+        z = base.copy()
+        z[14:16, 18:20] += 0.06
+
+        conservative_maps = compute_surface_maps(
+            z,
+            dx_mm=0.08,
+            dy_mm=0.08,
+            gaussian_sigma=0.0,
+            outlier_filter_mode="conservative",
+            outlier_window_size=3,
+            outlier_threshold_mm=0.02,
+            outlier_max_cluster_size=1,
+        )
+        medium_maps = compute_surface_maps(
+            z,
+            dx_mm=0.08,
+            dy_mm=0.08,
+            gaussian_sigma=0.0,
+            outlier_filter_mode="medium",
+            outlier_window_size=5,
+            outlier_threshold_mm=0.02,
+            outlier_max_cluster_size=4,
+        )
+
+        cluster = np.s_[14:16, 18:20]
+        conservative_error = float(
+            np.median(np.abs(conservative_maps["smoothed_height_mm"][cluster] - base[cluster]))
+        )
+        medium_error = float(np.median(np.abs(medium_maps["smoothed_height_mm"][cluster] - base[cluster])))
+
+        self.assertGreater(conservative_error, 0.03)
+        self.assertLess(medium_error, conservative_error * 0.2)
+
     def test_seam_correction_does_not_introduce_y_derivative_artifacts(self):
         stripe_height = 32
         width = 80
@@ -564,6 +666,91 @@ class TestPointCloudProcessor(unittest.TestCase):
             self.assertEqual(results["raw_height_mm"].shape, (96, 52))
             self.assertEqual(results["corrected_height_mm"].shape, (96, 52))
             self.assertEqual(results["resampled_height_mm"].shape, (24, 52))
+
+    def test_process_heightmap_reduces_outlier_artifacts_for_noisy_synthetic_input(self):
+        off_config = ProcessingConfig(
+            stripe_height=96,
+            num_stripes=1,
+            downsample_factor=1,
+            gaussian_sigma=0.0,
+            outlier_filter_mode="off",
+        )
+        filtered_config = ProcessingConfig(
+            stripe_height=96,
+            num_stripes=1,
+            downsample_factor=1,
+            gaussian_sigma=0.0,
+            outlier_filter_mode="medium",
+            outlier_window_size=5,
+            outlier_threshold_mm=0.02,
+            outlier_max_cluster_size=4,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            clean_input_path = tmp_path / "synthetic_clean.png"
+            input_path = tmp_path / "synthetic_noisy.png"
+            clean_output_dir = tmp_path / "clean"
+            off_output_dir = tmp_path / "off"
+            filtered_output_dir = tmp_path / "filtered"
+
+            clean_image = generate_synthetic_heightmap(
+                width=64,
+                stripe_height=96,
+                num_stripes=1,
+            )
+            image = clean_image.astype(np.int32, copy=True)
+            delta_gray = int(round(0.08 / off_config.dz_mm))
+            image[12, 10] += delta_gray
+            image[30, 26] -= delta_gray
+            image[54:56, 40:42] += delta_gray
+            image = np.clip(image, 0, np.iinfo(np.uint16).max).astype(np.uint16)
+            save_height_png(clean_image, clean_input_path)
+            save_height_png(image, input_path)
+
+            clean_results = process_heightmap(clean_input_path, clean_output_dir, off_config)
+            off_results = process_heightmap(input_path, off_output_dir, off_config)
+            filtered_results = process_heightmap(input_path, filtered_output_dir, filtered_config)
+
+            self.assertTrue((filtered_output_dir / "overview.png").exists())
+            self.assertTrue((filtered_output_dir / "grad_y.png").exists())
+
+            noisy_mask = np.abs(off_results["raw_height_mm"] - clean_results["raw_height_mm"]) > 1e-12
+            off_error = float(
+                np.max(
+                    np.abs(
+                        off_results["smoothed_height_mm"][noisy_mask]
+                        - clean_results["smoothed_height_mm"][noisy_mask]
+                    )
+                )
+            )
+            filtered_error = float(
+                np.max(
+                    np.abs(
+                        filtered_results["smoothed_height_mm"][noisy_mask]
+                        - clean_results["smoothed_height_mm"][noisy_mask]
+                    )
+                )
+            )
+            off_median_error = float(
+                np.median(
+                    np.abs(
+                        off_results["smoothed_height_mm"][noisy_mask]
+                        - clean_results["smoothed_height_mm"][noisy_mask]
+                    )
+                )
+            )
+            filtered_median_error = float(
+                np.median(
+                    np.abs(
+                        filtered_results["smoothed_height_mm"][noisy_mask]
+                        - clean_results["smoothed_height_mm"][noisy_mask]
+                    )
+                )
+            )
+
+            self.assertLess(filtered_error, off_error * 0.35)
+            self.assertLess(filtered_median_error, off_median_error * 0.2)
 
 
 if __name__ == "__main__":

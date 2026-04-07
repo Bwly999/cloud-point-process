@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.colors import TwoSlopeNorm
 from PIL import Image, ImageDraw
-from scipy.ndimage import gaussian_filter, gaussian_filter1d
+from scipy.ndimage import gaussian_filter, gaussian_filter1d, label, median_filter
 
 
 @dataclass
@@ -33,6 +33,11 @@ class ProcessingConfig:
     seam_flatten_method: str = "linear"
     pre_smooth_x_sigma: float = 0.0
     gaussian_sigma: float = 0.064
+    outlier_filter_mode: str = "off"
+    outlier_window_size: int = 0
+    outlier_threshold_mm: float = 0.0
+    outlier_max_cluster_size: int = 0
+    outlier_replace_mode: str = "median"
     crop_left_px: int = 0
     crop_right_px: int = 0
 
@@ -74,6 +79,11 @@ def generate_synthetic_heightmap(
     stripe_height: int = 2048,
     num_stripes: int = 3,
     dz_mm: float = 0.0001,
+    outlier_spike_count: int = 0,
+    outlier_cluster_count: int = 0,
+    outlier_cluster_size: int = 2,
+    outlier_amplitude_mm: float = 0.06,
+    outlier_seed: int = 17,
 ) -> np.ndarray:
     total_height = stripe_height * num_stripes
     x_mm = np.linspace(-6.0, 6.0, width, dtype=np.float64)
@@ -110,10 +120,121 @@ def generate_synthetic_heightmap(
     rng = np.random.RandomState(7)
     surface_mm += rng.normal(scale=0.002, size=surface_mm.shape)
 
+    if outlier_spike_count < 0 or outlier_cluster_count < 0:
+        raise ValueError("Outlier counts must be non-negative.")
+    if outlier_cluster_size <= 0:
+        raise ValueError("outlier_cluster_size must be positive.")
+    if outlier_amplitude_mm < 0:
+        raise ValueError("outlier_amplitude_mm must be non-negative.")
+
+    if outlier_spike_count > 0 or outlier_cluster_count > 0:
+        outlier_rng = np.random.RandomState(outlier_seed)
+
+        for _ in range(outlier_spike_count):
+            row = int(outlier_rng.randint(0, total_height))
+            col = int(outlier_rng.randint(0, width))
+            sign = -1.0 if outlier_rng.rand() < 0.5 else 1.0
+            scale = 0.8 + 0.4 * outlier_rng.rand()
+            surface_mm[row, col] += sign * outlier_amplitude_mm * scale
+
+        cluster_span = min(outlier_cluster_size, total_height, width)
+        for _ in range(outlier_cluster_count):
+            row = int(outlier_rng.randint(0, total_height - cluster_span + 1))
+            col = int(outlier_rng.randint(0, width - cluster_span + 1))
+            sign = -1.0 if outlier_rng.rand() < 0.5 else 1.0
+            scale = 0.8 + 0.4 * outlier_rng.rand()
+            surface_mm[row:row + cluster_span, col:col + cluster_span] += sign * outlier_amplitude_mm * scale
+
     surface_mm = surface_mm - surface_mm.min() + 0.25
     gray = np.rint(surface_mm / dz_mm)
     gray = np.clip(gray, 0, np.iinfo(np.uint16).max)
     return gray.astype(np.uint16)
+
+
+_OUTLIER_FILTER_DEFAULTS = {
+    "off": {"window_size": 0, "threshold_mm": 0.0, "max_cluster_size": 0},
+    "conservative": {"window_size": 3, "threshold_mm": 0.02, "max_cluster_size": 1},
+    "medium": {"window_size": 5, "threshold_mm": 0.01, "max_cluster_size": 4},
+}
+
+
+def _resolve_outlier_filter_params(
+    mode: str,
+    window_size: int,
+    threshold_mm: float,
+    max_cluster_size: int,
+    replace_mode: str,
+) -> Tuple[str, int, float, int, str]:
+    normalized_mode = mode.lower()
+    if normalized_mode not in _OUTLIER_FILTER_DEFAULTS:
+        raise ValueError("Unsupported outlier filter mode: {}".format(mode))
+    if replace_mode != "median":
+        raise ValueError("Unsupported outlier replace mode: {}".format(replace_mode))
+    if normalized_mode == "off":
+        return normalized_mode, 0, 0.0, 0, replace_mode
+
+    defaults = _OUTLIER_FILTER_DEFAULTS[normalized_mode]
+    resolved_window_size = window_size if window_size > 0 else defaults["window_size"]
+    resolved_threshold_mm = threshold_mm if threshold_mm > 0 else defaults["threshold_mm"]
+    resolved_max_cluster_size = max_cluster_size if max_cluster_size > 0 else defaults["max_cluster_size"]
+
+    if resolved_window_size <= 1:
+        raise ValueError("outlier_window_size must be greater than 1 when outlier filtering is enabled.")
+    if resolved_window_size % 2 == 0:
+        raise ValueError("outlier_window_size must be an odd integer.")
+    if resolved_threshold_mm <= 0:
+        raise ValueError("outlier_threshold_mm must be positive when outlier filtering is enabled.")
+    if resolved_max_cluster_size <= 0:
+        raise ValueError("outlier_max_cluster_size must be positive when outlier filtering is enabled.")
+
+    return (
+        normalized_mode,
+        resolved_window_size,
+        resolved_threshold_mm,
+        resolved_max_cluster_size,
+        replace_mode,
+    )
+
+
+def filter_height_outliers(
+    z_mm: np.ndarray,
+    mode: str = "off",
+    window_size: int = 0,
+    threshold_mm: float = 0.0,
+    max_cluster_size: int = 0,
+    replace_mode: str = "median",
+) -> np.ndarray:
+    if z_mm.ndim != 2:
+        raise ValueError("Height map must be a 2D array.")
+
+    resolved_mode, resolved_window_size, resolved_threshold_mm, resolved_max_cluster_size, _ = (
+        _resolve_outlier_filter_params(mode, window_size, threshold_mm, max_cluster_size, replace_mode)
+    )
+    if resolved_mode == "off":
+        return z_mm.astype(np.float64, copy=True)
+
+    local_median = median_filter(z_mm, size=(resolved_window_size, resolved_window_size), mode="nearest")
+    residual = np.abs(z_mm - local_median)
+    candidate_mask = residual >= resolved_threshold_mm
+    if not np.any(candidate_mask):
+        return z_mm.astype(np.float64, copy=True)
+
+    # 组件面积使用“强离群核心”而不是整块候选区域来衡量，避免小团簇
+    # 周围被阈值带出的弱响应像素把面积虚增，导致 2x2 一类的小异常
+    # 无法按 medium 档被识别出来。
+    core_mask = residual >= (resolved_threshold_mm * 1.5)
+    structure = np.ones((3, 3), dtype=np.int8)
+    labeled_mask, num_labels = label(candidate_mask, structure=structure)
+    replace_mask = np.zeros_like(candidate_mask, dtype=bool)
+    for component_id in range(1, num_labels + 1):
+        component = labeled_mask == component_id
+        core_size = int(np.count_nonzero(component & core_mask))
+        if 0 < core_size <= resolved_max_cluster_size:
+            replace_mask |= component
+
+    filtered = z_mm.astype(np.float64, copy=True)
+    filtered[replace_mask] = local_median[replace_mask]
+    return filtered
 
 
 def _project_window_to_target(rows: np.ndarray, target_row: float) -> np.ndarray:
@@ -374,11 +495,23 @@ def compute_surface_maps(
     dy_mm: float,
     gaussian_sigma: float = 0.064,
     pre_smooth_x_sigma: float = 0.0,
+    outlier_filter_mode: str = "off",
+    outlier_window_size: int = 0,
+    outlier_threshold_mm: float = 0.0,
+    outlier_max_cluster_size: int = 0,
+    outlier_replace_mode: str = "median",
 ) -> Dict[str, np.ndarray]:
     if z_mm.ndim != 2:
         raise ValueError("Height map must be a 2D array.")
 
-    z_used = z_mm.astype(np.float64, copy=True)
+    z_used = filter_height_outliers(
+        z_mm,
+        mode=outlier_filter_mode,
+        window_size=outlier_window_size,
+        threshold_mm=outlier_threshold_mm,
+        max_cluster_size=outlier_max_cluster_size,
+        replace_mode=outlier_replace_mode,
+    )
 
     # 仅在 X 方向做轻量平滑，用来压制列间高频条纹。sigma 使用物理
     # 长度 mm 表示，再按 dx 换算成像素，避免采样率变化时平滑宽度失真。
@@ -417,6 +550,11 @@ def compute_resampled_surface_maps(
     downsample_factor: int,
     gaussian_sigma: float = 0.064,
     pre_smooth_x_sigma: float = 0.0,
+    outlier_filter_mode: str = "off",
+    outlier_window_size: int = 0,
+    outlier_threshold_mm: float = 0.0,
+    outlier_max_cluster_size: int = 0,
+    outlier_replace_mode: str = "median",
 ) -> Tuple[Dict[str, np.ndarray], float]:
     full_resolution_maps = compute_surface_maps(
         z_mm,
@@ -424,6 +562,11 @@ def compute_resampled_surface_maps(
         dy_mm=dy_mm,
         gaussian_sigma=gaussian_sigma,
         pre_smooth_x_sigma=pre_smooth_x_sigma,
+        outlier_filter_mode=outlier_filter_mode,
+        outlier_window_size=outlier_window_size,
+        outlier_threshold_mm=outlier_threshold_mm,
+        outlier_max_cluster_size=outlier_max_cluster_size,
+        outlier_replace_mode=outlier_replace_mode,
     )
 
     resampled_maps: Dict[str, np.ndarray] = {}
@@ -585,6 +728,11 @@ def process_heightmap(input_path: Path, output_dir: Path, config: ProcessingConf
         downsample_factor=config.downsample_factor,
         gaussian_sigma=config.gaussian_sigma,
         pre_smooth_x_sigma=config.pre_smooth_x_sigma,
+        outlier_filter_mode=config.outlier_filter_mode,
+        outlier_window_size=config.outlier_window_size,
+        outlier_threshold_mm=config.outlier_threshold_mm,
+        outlier_max_cluster_size=config.outlier_max_cluster_size,
+        outlier_replace_mode=config.outlier_replace_mode,
     )
 
     save_preview_png(raw_height_mm, output_dir / "height_raw_preview.png", "viridis", False, "Raw Height (mm)")
@@ -698,6 +846,60 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=0.064,
         help="求导前对整图做轻量高斯平滑的物理尺度，单位 mm，用于抑制噪声。",
     )
+    parser.add_argument(
+        "--outlier-filter-mode",
+        choices=["off", "conservative", "medium"],
+        default="off",
+        help="离群噪点滤除模式。off 关闭；conservative 只处理孤立尖刺；medium 额外处理小团簇离群点。",
+    )
+    parser.add_argument(
+        "--outlier-window-size",
+        type=int,
+        default=0,
+        help="离群检测局部窗口尺寸，必须是奇数。设为 0 时按模式使用默认值。",
+    )
+    parser.add_argument(
+        "--outlier-threshold-mm",
+        type=float,
+        default=0.0,
+        help="离群点相对局部中值的高度阈值，单位 mm。设为 0 时按模式使用默认值。",
+    )
+    parser.add_argument(
+        "--outlier-max-cluster-size",
+        type=int,
+        default=0,
+        help="允许被替换的小连通域最大面积，单位像素。设为 0 时按模式使用默认值。",
+    )
+    parser.add_argument(
+        "--outlier-replace-mode",
+        choices=["median"],
+        default="median",
+        help="离群点替换方式。当前仅支持 median。",
+    )
+    parser.add_argument(
+        "--synthetic-outlier-spike-count",
+        type=int,
+        default=0,
+        help="生成假图时注入的单像素尖刺噪点数量。",
+    )
+    parser.add_argument(
+        "--synthetic-outlier-cluster-count",
+        type=int,
+        default=0,
+        help="生成假图时注入的小团簇离群点数量。",
+    )
+    parser.add_argument(
+        "--synthetic-outlier-cluster-size",
+        type=int,
+        default=2,
+        help="生成假图时每个小团簇的边长，单位像素。",
+    )
+    parser.add_argument(
+        "--synthetic-outlier-amplitude-mm",
+        type=float,
+        default=0.06,
+        help="生成假图时离群噪点的幅值，单位 mm。",
+    )
     return parser
 
 
@@ -723,6 +925,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         seam_flatten_method=args.seam_flatten_method,
         pre_smooth_x_sigma=args.pre_smooth_x_sigma,
         gaussian_sigma=args.gaussian_sigma,
+        outlier_filter_mode=args.outlier_filter_mode,
+        outlier_window_size=args.outlier_window_size,
+        outlier_threshold_mm=args.outlier_threshold_mm,
+        outlier_max_cluster_size=args.outlier_max_cluster_size,
+        outlier_replace_mode=args.outlier_replace_mode,
     )
 
     output_dir = Path(args.output_dir)
@@ -733,6 +940,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             stripe_height=args.stripe_height,
             num_stripes=args.num_stripes,
             dz_mm=args.dz_mm,
+            outlier_spike_count=args.synthetic_outlier_spike_count,
+            outlier_cluster_count=args.synthetic_outlier_cluster_count,
+            outlier_cluster_size=args.synthetic_outlier_cluster_size,
+            outlier_amplitude_mm=args.synthetic_outlier_amplitude_mm,
         )
         output_dir.mkdir(parents=True, exist_ok=True)
         input_path = output_dir / "synthetic_input.png"

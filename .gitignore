@@ -15,7 +15,10 @@ demo_outputs_*/
 sample_outputs/
 sample_outputs_verify/
 tmp_sigma_scan/
-
+*.csv
+*.png
+*.tiff
+!tests/fixtures/synthetic_outlier_noise.png
 # Binary packages and archives
 *.zip
 
