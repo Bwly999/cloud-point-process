@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Callable, Dict, List, Sequence, Tuple
 
 import matplotlib
 
@@ -38,6 +40,7 @@ class ProcessingConfig:
     outlier_threshold_mm: float = 0.0
     outlier_max_cluster_size: int = 0
     outlier_replace_mode: str = "median"
+    outlier_debug: bool = False
     crop_left_px: int = 0
     crop_right_px: int = 0
 
@@ -203,38 +206,82 @@ def filter_height_outliers(
     threshold_mm: float = 0.0,
     max_cluster_size: int = 0,
     replace_mode: str = "median",
-) -> np.ndarray:
+) -> Dict[str, object]:
     if z_mm.ndim != 2:
         raise ValueError("Height map must be a 2D array.")
 
-    resolved_mode, resolved_window_size, resolved_threshold_mm, resolved_max_cluster_size, _ = (
+    resolved_mode, resolved_window_size, resolved_threshold_mm, resolved_max_cluster_size, resolved_replace_mode = (
         _resolve_outlier_filter_params(mode, window_size, threshold_mm, max_cluster_size, replace_mode)
     )
+    z_float = z_mm.astype(np.float64, copy=True)
+    debug_info: Dict[str, object] = {
+        "mode": resolved_mode,
+        "window_size": resolved_window_size,
+        "threshold_mm": resolved_threshold_mm,
+        "max_cluster_size": resolved_max_cluster_size,
+        "replace_mode": resolved_replace_mode,
+        "local_median": z_float.copy(),
+        "residual": np.zeros_like(z_float),
+        "candidate_mask": np.zeros_like(z_float, dtype=bool),
+        "core_mask": np.zeros_like(z_float, dtype=bool),
+        "replace_mask": np.zeros_like(z_float, dtype=bool),
+        "components": [],
+    }
     if resolved_mode == "off":
-        return z_mm.astype(np.float64, copy=True)
+        return {"filtered": z_float, "debug": debug_info}
 
     local_median = median_filter(z_mm, size=(resolved_window_size, resolved_window_size), mode="nearest")
     residual = np.abs(z_mm - local_median)
     candidate_mask = residual >= resolved_threshold_mm
+    debug_info["local_median"] = local_median.astype(np.float64, copy=False)
+    debug_info["residual"] = residual.astype(np.float64, copy=False)
+    debug_info["candidate_mask"] = candidate_mask.copy()
     if not np.any(candidate_mask):
-        return z_mm.astype(np.float64, copy=True)
+        return {"filtered": z_float, "debug": debug_info}
 
     # 组件面积使用“强离群核心”而不是整块候选区域来衡量，避免小团簇
     # 周围被阈值带出的弱响应像素把面积虚增，导致 2x2 一类的小异常
     # 无法按 medium 档被识别出来。
     core_mask = residual >= (resolved_threshold_mm * 1.5)
+    debug_info["core_mask"] = core_mask.copy()
     structure = np.ones((3, 3), dtype=np.int8)
     labeled_mask, num_labels = label(candidate_mask, structure=structure)
     replace_mask = np.zeros_like(candidate_mask, dtype=bool)
+    components = []
     for component_id in range(1, num_labels + 1):
         component = labeled_mask == component_id
         core_size = int(np.count_nonzero(component & core_mask))
-        if 0 < core_size <= resolved_max_cluster_size:
+        candidate_area = int(np.count_nonzero(component))
+        component_rows, component_cols = np.where(component)
+        max_residual_mm = float(np.max(residual[component]))
+        replaced = 0 < core_size <= resolved_max_cluster_size
+        if replaced:
             replace_mask |= component
+            reject_reason = ""
+        elif core_size <= 0:
+            reject_reason = "no_core_pixels"
+        else:
+            reject_reason = "core_area_too_large"
+        components.append(
+            {
+                "component_id": component_id,
+                "y0": int(component_rows.min()),
+                "y1": int(component_rows.max()),
+                "x0": int(component_cols.min()),
+                "x1": int(component_cols.max()),
+                "candidate_area": candidate_area,
+                "core_area": core_size,
+                "max_residual_mm": max_residual_mm,
+                "replaced": int(replaced),
+                "reject_reason": reject_reason,
+            }
+        )
 
-    filtered = z_mm.astype(np.float64, copy=True)
+    filtered = z_float.copy()
     filtered[replace_mask] = local_median[replace_mask]
-    return filtered
+    debug_info["replace_mask"] = replace_mask
+    debug_info["components"] = components
+    return {"filtered": filtered, "debug": debug_info}
 
 
 def _project_window_to_target(rows: np.ndarray, target_row: float) -> np.ndarray:
@@ -504,7 +551,7 @@ def compute_surface_maps(
     if z_mm.ndim != 2:
         raise ValueError("Height map must be a 2D array.")
 
-    z_used = filter_height_outliers(
+    outlier_result = filter_height_outliers(
         z_mm,
         mode=outlier_filter_mode,
         window_size=outlier_window_size,
@@ -512,6 +559,7 @@ def compute_surface_maps(
         max_cluster_size=outlier_max_cluster_size,
         replace_mode=outlier_replace_mode,
     )
+    z_used = np.asarray(outlier_result["filtered"], dtype=np.float64)
 
     # 仅在 X 方向做轻量平滑，用来压制列间高频条纹。sigma 使用物理
     # 长度 mm 表示，再按 dx 换算成像素，避免采样率变化时平滑宽度失真。
@@ -532,7 +580,7 @@ def compute_surface_maps(
     curve_x = curv2_x / np.power(1.0 + grad_x * grad_x, 1.5)
     curve_y = curv2_y / np.power(1.0 + grad_y * grad_y, 1.5)
 
-    return {
+    maps: Dict[str, np.ndarray] = {
         "smoothed_height_mm": z_used,
         "grad_x": grad_x,
         "grad_y": grad_y,
@@ -541,6 +589,9 @@ def compute_surface_maps(
         "curve_x": curve_x,
         "curve_y": curve_y,
     }
+    if outlier_filter_mode != "off":
+        maps["outlier_debug"] = outlier_result["debug"]  # type: ignore[assignment]
+    return maps
 
 
 def compute_resampled_surface_maps(
@@ -555,7 +606,7 @@ def compute_resampled_surface_maps(
     outlier_threshold_mm: float = 0.0,
     outlier_max_cluster_size: int = 0,
     outlier_replace_mode: str = "median",
-) -> Tuple[Dict[str, np.ndarray], float]:
+) -> Tuple[Dict[str, object], float]:
     full_resolution_maps = compute_surface_maps(
         z_mm,
         dx_mm=dx_mm,
@@ -569,9 +620,12 @@ def compute_resampled_surface_maps(
         outlier_replace_mode=outlier_replace_mode,
     )
 
-    resampled_maps: Dict[str, np.ndarray] = {}
+    resampled_maps: Dict[str, object] = {}
     resampled_dy_mm = dy_mm
     for key, value in full_resolution_maps.items():
+        if key == "outlier_debug":
+            resampled_maps[key] = value
+            continue
         resampled_value, current_resampled_dy_mm = sample_y_block_centers(
             value,
             factor=downsample_factor,
@@ -586,6 +640,15 @@ def compute_resampled_surface_maps(
 def save_csv(array: np.ndarray, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savetxt(str(path), array, delimiter=",", fmt="%.8f")
+
+
+def save_records_csv(rows: List[Dict[str, object]], fieldnames: Sequence[str], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
 
 
 def save_xyz_csv(array: np.ndarray, dx_mm: float, dy_mm: float, path: Path) -> None:
@@ -632,6 +695,126 @@ def save_preview_png(
     fig.tight_layout()
     fig.savefig(str(path), bbox_inches="tight")
     plt.close(fig)
+
+
+def save_mask_preview_png(mask: np.ndarray, path: Path, title: str) -> None:
+    save_preview_png(mask.astype(np.float64), path, "gray", False, title)
+
+
+def _format_outlier_component_label(component: Dict[str, object]) -> str:
+    base = "id={} core={} res={:.4f}".format(
+        component["component_id"],
+        component["core_area"],
+        float(component["max_residual_mm"]),
+    )
+    if bool(component["replaced"]):
+        return base + " replaced"
+    reject_reason = str(component["reject_reason"])
+    return base + " " + reject_reason
+
+
+def save_outlier_component_overview_png(output_dir: Path, debug: Dict[str, object]) -> None:
+    residual = np.asarray(debug["residual"], dtype=np.float64)
+    components = list(debug["components"])
+
+    fig, ax = plt.subplots(figsize=(10, 4), dpi=150)
+    vmin, vmax = _percentile_limits(residual)
+    image = ax.imshow(residual, cmap="magma", vmin=vmin, vmax=vmax, aspect="auto")
+    for component in components:
+        x0 = int(component["x0"])
+        x1 = int(component["x1"])
+        y0 = int(component["y0"])
+        y1 = int(component["y1"])
+        replaced = bool(component["replaced"])
+        color = "#2ca02c" if replaced else "#d62728"
+        rect = plt.Rectangle(
+            (x0 - 0.5, y0 - 0.5),
+            x1 - x0 + 1,
+            y1 - y0 + 1,
+            fill=False,
+            edgecolor=color,
+            linewidth=1.2,
+        )
+        ax.add_patch(rect)
+        label = _format_outlier_component_label(component)
+        text_y = max(y0 - 1.0, 0.0)
+        ax.text(
+            x0,
+            text_y,
+            label,
+            fontsize=6,
+            color=color,
+            ha="left",
+            va="bottom",
+            bbox={"facecolor": "white", "edgecolor": color, "alpha": 0.75, "pad": 1.5},
+        )
+
+    ax.set_title(
+        "Outlier Components | mode={} window={} threshold={:.4f} max_cluster={}".format(
+            debug["mode"],
+            debug["window_size"],
+            float(debug["threshold_mm"]),
+            debug["max_cluster_size"],
+        )
+    )
+    ax.set_xlabel("X pixel")
+    ax.set_ylabel("Y pixel")
+    fig.colorbar(image, ax=ax, shrink=0.8)
+    fig.tight_layout()
+    fig.savefig(str(output_dir / "outlier_component_overview.png"), bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_outlier_debug_artifacts(output_dir: Path, debug: Dict[str, object]) -> None:
+    if not debug:
+        return
+
+    save_preview_png(
+        np.asarray(debug["local_median"], dtype=np.float64),
+        output_dir / "outlier_local_median_preview.png",
+        "viridis",
+        False,
+        "Outlier Local Median (mm)",
+    )
+    save_preview_png(
+        np.asarray(debug["residual"], dtype=np.float64),
+        output_dir / "outlier_residual.png",
+        "magma",
+        False,
+        "Outlier Residual (mm)",
+    )
+    save_mask_preview_png(
+        np.asarray(debug["candidate_mask"], dtype=bool),
+        output_dir / "outlier_candidate_mask.png",
+        "Outlier Candidate Mask",
+    )
+    save_mask_preview_png(
+        np.asarray(debug["core_mask"], dtype=bool),
+        output_dir / "outlier_core_mask.png",
+        "Outlier Core Mask",
+    )
+    save_mask_preview_png(
+        np.asarray(debug["replace_mask"], dtype=bool),
+        output_dir / "outlier_replace_mask.png",
+        "Outlier Replace Mask",
+    )
+    save_outlier_component_overview_png(output_dir, debug)
+    save_records_csv(
+        rows=list(debug["components"]),
+        fieldnames=[
+            "component_id",
+            "y0",
+            "y1",
+            "x0",
+            "x1",
+            "candidate_area",
+            "core_area",
+            "max_residual_mm",
+            "replaced",
+            "reject_reason",
+        ],
+        path=output_dir / "outlier_components.csv",
+    )
 
 
 def save_overview_png(output_dir: Path) -> None:
@@ -683,7 +866,40 @@ def save_overview_png(output_dir: Path) -> None:
     overview.save(str(output_dir / "overview.png"))
 
 
-def process_heightmap(input_path: Path, output_dir: Path, config: ProcessingConfig) -> Dict[str, np.ndarray]:
+def _report_progress(
+    step_index: int,
+    total_steps: int,
+    label: str,
+    started_at: float,
+    step_started_at: float,
+) -> float:
+    now = time.perf_counter()
+    elapsed = now - started_at
+    completed_steps = max(step_index - 1, 0)
+    current_step_duration = max(now - step_started_at, 0.0)
+    average_step = elapsed / completed_steps if completed_steps > 0 else current_step_duration
+    baseline = max(current_step_duration, average_step, 0.05)
+    remaining = baseline * max(total_steps - step_index, 0)
+    print(
+        "[{}/{}] {}... 已耗时 {:.1f}s，预计剩余 {:.1f}s".format(
+            step_index,
+            total_steps,
+            label,
+            elapsed,
+            max(remaining, 0.0),
+        )
+    )
+    return now
+
+
+def process_heightmap(
+    input_path: Path,
+    output_dir: Path,
+    config: ProcessingConfig,
+    progress: Callable[[str], None] | None = None,
+) -> Dict[str, object]:
+    if progress is not None:
+        progress("读取输入并准备数据")
     gray = load_height_png(Path(input_path))
     if gray.shape[0] != config.expected_height:
         raise ValueError(
@@ -708,6 +924,8 @@ def process_heightmap(input_path: Path, output_dir: Path, config: ProcessingConf
     output_dir.mkdir(parents=True, exist_ok=True)
 
     raw_height_mm = gray.astype(np.float64) * config.dz_mm
+    if progress is not None:
+        progress("执行接缝修正")
     corrected_height_mm, seam_offsets = correct_scan_band_offsets(
         raw_height_mm,
         stripe_height=config.stripe_height,
@@ -721,6 +939,8 @@ def process_heightmap(input_path: Path, output_dir: Path, config: ProcessingConf
         num_stripes=config.num_stripes,
     )
     resampled_height_mm, _ = downsample_y(corrected_height_mm, factor=config.downsample_factor, dy_mm=config.dy_mm)
+    if progress is not None:
+        progress("计算表面图与噪点诊断")
     maps, resampled_dy_mm = compute_resampled_surface_maps(
         corrected_height_mm,
         dx_mm=config.dx_mm,
@@ -735,6 +955,8 @@ def process_heightmap(input_path: Path, output_dir: Path, config: ProcessingConf
         outlier_replace_mode=config.outlier_replace_mode,
     )
 
+    if progress is not None:
+        progress("导出结果文件")
     save_preview_png(raw_height_mm, output_dir / "height_raw_preview.png", "viridis", False, "Raw Height (mm)")
     save_preview_png(
         corrected_height_mm,
@@ -765,10 +987,13 @@ def process_heightmap(input_path: Path, output_dir: Path, config: ProcessingConf
         save_float_tiff(maps[key], output_dir / (key + ".tiff"))
         save_preview_png(maps[key], output_dir / (key + ".png"), "coolwarm", True, key)
 
+    if config.outlier_debug and "outlier_debug" in maps:
+        save_outlier_debug_artifacts(output_dir, maps["outlier_debug"])
+
     # 生成总览图，便于快速检查高度图修正前后以及 Y 向结果是否仍有接缝伪影。
     save_overview_png(output_dir)
 
-    results = {
+    results: Dict[str, object] = {
         "raw_height_mm": raw_height_mm,
         "corrected_height_mm": corrected_height_mm,
         "resampled_height_mm": resampled_height_mm,
@@ -776,7 +1001,7 @@ def process_heightmap(input_path: Path, output_dir: Path, config: ProcessingConf
         "resampled_dy_mm": np.array([resampled_dy_mm], dtype=np.float64),
     }
     results.update(maps)
-    return results
+    return results  # type: ignore[return-value]
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -877,6 +1102,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="离群点替换方式。当前仅支持 median。",
     )
     parser.add_argument(
+        "--outlier-debug",
+        action="store_true",
+        help="导出噪点滤除诊断图和连通域 CSV，便于分析某块区域为何未被替换。",
+    )
+    parser.add_argument(
         "--synthetic-outlier-spike-count",
         type=int,
         default=0,
@@ -930,6 +1160,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         outlier_threshold_mm=args.outlier_threshold_mm,
         outlier_max_cluster_size=args.outlier_max_cluster_size,
         outlier_replace_mode=args.outlier_replace_mode,
+        outlier_debug=args.outlier_debug,
     )
 
     output_dir = Path(args.output_dir)
@@ -951,7 +1182,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     elif input_path is None:
         parser.error("请通过 --input 指定输入 PNG，或使用 --generate-synthetic 生成假图。")
 
-    process_heightmap(input_path, output_dir, config)
+    total_steps = 4
+    started_at = time.perf_counter()
+    last_mark = started_at
+    current_step = 0
+
+    def progress(label: str) -> None:
+        nonlocal current_step, last_mark
+        current_step += 1
+        last_mark = _report_progress(current_step, total_steps, label, started_at, last_mark)
+
+    process_heightmap(input_path, output_dir, config, progress=progress)
     print("处理完成，结果已输出到 {}".format(output_dir))
     return 0
 

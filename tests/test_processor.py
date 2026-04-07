@@ -1,5 +1,7 @@
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 
 import numpy as np
@@ -7,6 +9,7 @@ from scipy.ndimage import gaussian_filter
 
 from cloud_point_process.processor import (
     ProcessingConfig,
+    _format_outlier_component_label,
     _estimate_window_slope,
     compute_resampled_surface_maps,
     compute_surface_maps,
@@ -14,12 +17,29 @@ from cloud_point_process.processor import (
     downsample_y,
     flatten_seam_artifacts,
     generate_synthetic_heightmap,
+    main,
     process_heightmap,
     save_height_png,
 )
 
 
 class TestPointCloudProcessor(unittest.TestCase):
+    def test_format_outlier_component_label_includes_reject_reason_for_unreplaced_component(self):
+        component = {
+            "component_id": 7,
+            "core_area": 9,
+            "max_residual_mm": 0.0834,
+            "replaced": 0,
+            "reject_reason": "core_area_too_large",
+        }
+
+        label = _format_outlier_component_label(component)
+
+        self.assertIn("id=7", label)
+        self.assertIn("core=9", label)
+        self.assertIn("res=0.0834", label)
+        self.assertIn("core_area_too_large", label)
+
     def test_estimate_window_slope_ignores_seam_side_spikes(self):
         stripe_height = 64
         width = 96
@@ -751,6 +771,107 @@ class TestPointCloudProcessor(unittest.TestCase):
 
             self.assertLess(filtered_error, off_error * 0.35)
             self.assertLess(filtered_median_error, off_median_error * 0.2)
+
+    def test_process_heightmap_exports_outlier_debug_artifacts(self):
+        config = ProcessingConfig(
+            stripe_height=96,
+            num_stripes=1,
+            downsample_factor=1,
+            gaussian_sigma=0.0,
+            outlier_filter_mode="medium",
+            outlier_window_size=5,
+            outlier_threshold_mm=0.02,
+            outlier_max_cluster_size=4,
+            outlier_debug=True,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            input_path = tmp_path / "synthetic_debug.png"
+            output_dir = tmp_path / "debug_outputs"
+
+            image = generate_synthetic_heightmap(width=64, stripe_height=96, num_stripes=1)
+            image = image.astype(np.int32, copy=True)
+            delta_gray = int(round(0.08 / config.dz_mm))
+            image[14, 12] += delta_gray
+            image[44:46, 30:32] += delta_gray
+            image[70:73, 48:51] += delta_gray
+            image = np.clip(image, 0, np.iinfo(np.uint16).max).astype(np.uint16)
+            save_height_png(image, input_path)
+
+            process_heightmap(input_path, output_dir, config)
+
+            expected_files = [
+                "outlier_residual.png",
+                "outlier_candidate_mask.png",
+                "outlier_core_mask.png",
+                "outlier_replace_mask.png",
+                "outlier_local_median_preview.png",
+                "outlier_component_overview.png",
+                "outlier_components.csv",
+            ]
+            for filename in expected_files:
+                self.assertTrue((output_dir / filename).exists(), filename)
+
+            components = np.genfromtxt(
+                output_dir / "outlier_components.csv",
+                delimiter=",",
+                names=True,
+                dtype=None,
+                encoding="utf-8",
+            )
+            self.assertGreaterEqual(components.shape[0], 2)
+            self.assertIn("replaced", components.dtype.names)
+            self.assertIn("reject_reason", components.dtype.names)
+            self.assertIn("core_area", components.dtype.names)
+            self.assertIn("candidate_area", components.dtype.names)
+            self.assertTrue(any(row["replaced"] == 1 for row in np.atleast_1d(components)))
+            self.assertTrue(any(row["reject_reason"] == "core_area_too_large" for row in np.atleast_1d(components)))
+
+    def test_main_prints_brief_progress_with_eta(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            input_path = tmp_path / "progress_input.png"
+            output_dir = tmp_path / "progress_outputs"
+
+            image = generate_synthetic_heightmap(width=64, stripe_height=96, num_stripes=1)
+            save_height_png(image, input_path)
+
+            buffer = StringIO()
+            with redirect_stdout(buffer):
+                exit_code = main(
+                    [
+                        "--input",
+                        str(input_path),
+                        "--output-dir",
+                        str(output_dir),
+                        "--stripe-height",
+                        "96",
+                        "--num-stripes",
+                        "1",
+                        "--downsample-factor",
+                        "1",
+                        "--outlier-filter-mode",
+                        "medium",
+                        "--outlier-window-size",
+                        "5",
+                        "--outlier-threshold-mm",
+                        "0.02",
+                        "--outlier-max-cluster-size",
+                        "4",
+                        "--outlier-debug",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            output = buffer.getvalue()
+            self.assertIn("读取输入并准备数据", output)
+            self.assertIn("执行接缝修正", output)
+            self.assertIn("计算表面图与噪点诊断", output)
+            self.assertIn("导出结果文件", output)
+            self.assertIn("处理完成", output)
+            self.assertIn("已耗时", output)
+            self.assertIn("预计剩余", output)
 
 
 if __name__ == "__main__":

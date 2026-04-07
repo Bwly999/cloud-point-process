@@ -67,7 +67,8 @@ python process_heightmap.py ^
   --outlier-filter-mode medium ^
   --outlier-window-size 5 ^
   --outlier-threshold-mm 0.02 ^
-  --outlier-max-cluster-size 4
+  --outlier-max-cluster-size 4 ^
+  --outlier-debug
 ```
 
 ### 5. 生成带尖刺/小团簇噪点的假图
@@ -171,6 +172,9 @@ python package_zip.py --output my-release.zip
   - 设为 `0` 时，按模式使用默认值
 - `--outlier-replace-mode`
   - 当前仅支持 `median`
+- `--outlier-debug`
+  - 导出噪点滤除诊断图和组件 CSV
+  - 用来判断某块区域为什么没被替换
 
 默认模式参数：
 
@@ -188,6 +192,24 @@ python package_zip.py --output my-release.zip
 - 如果真实表面上存在少量突兀飞点，先试 `conservative`
 - 如果异常表现为 `2x2`、`3x3` 一类的小块噪点，再试 `medium`
 - 阈值越小、连通域面积越大，滤除越激进，也越容易抹掉真实尖峰细节
+
+开启 `--outlier-debug` 后，会额外导出：
+
+- `outlier_local_median_preview.png`
+- `outlier_residual.png`
+- `outlier_candidate_mask.png`
+- `outlier_core_mask.png`
+- `outlier_replace_mask.png`
+- `outlier_components.csv`
+
+常见判读方法：
+
+- `outlier_residual` 明显高，但 `candidate_mask` 没亮
+  - `--outlier-threshold-mm` 设得太高
+- `candidate_mask` 亮了，但 `replace_mask` 没亮
+  - 通常是 `core_area` 超过 `--outlier-max-cluster-size`
+- `local_median` 在该区域明显被周围结构带偏
+  - 可以尝试增大 `--outlier-window-size`
 
 ## 输出文件
 
